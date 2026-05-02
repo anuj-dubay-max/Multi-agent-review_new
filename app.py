@@ -22,18 +22,25 @@ import plotly.graph_objects as go
 load_dotenv()
 
 def get_client():
-    api_key = (
-        os.getenv("GROQ_API_KEY")
-        or st.secrets.get("GROQ_API_KEY", None)
-        or st.session_state.get("groq_api_key", None)
-    )
+    api_key = None
+
+    # Priority 1: Streamlit secrets
+    if "GROQ_API_KEY" in st.secrets:
+        api_key = st.secrets["GROQ_API_KEY"]
+    # Priority 2: Environment variable  
+    elif os.getenv("GROQ_API_KEY"):
+        api_key = os.getenv("GROQ_API_KEY")
+    # Priority 3: Session state from user input
+    elif st.session_state.get("groq_api_key"):
+        api_key = st.session_state.get("groq_api_key")
 
     if not api_key:
         return None
 
     try:
         return Groq(api_key=api_key)
-    except Exception:
+    except Exception as e:
+        st.error(f"Groq client error: {e}")
         return None
     
 def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=1200):
@@ -1102,6 +1109,7 @@ with tab1:
                 st.stop()
 
             client = get_client()
+            st.write("Client:", client)
             if not client:
                 st.error("API key not found.")
             else:
