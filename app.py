@@ -16,34 +16,28 @@ from datetime import datetime
 from groq import Groq
 from dotenv import load_dotenv
 import plotly.graph_objects as go
+import requests
 
 
 
 load_dotenv()
 
 def get_client():
-    api_key = None
-
-    # Priority 1: Streamlit secrets
-    if "GROQ_API_KEY" in st.secrets:
-        api_key = st.secrets["GROQ_API_KEY"]
-    # Priority 2: Environment variable  
-    elif os.getenv("GROQ_API_KEY"):
-        api_key = os.getenv("GROQ_API_KEY")
-    # Priority 3: Session state from user input
-    elif st.session_state.get("groq_api_key"):
-        api_key = st.session_state.get("groq_api_key")
+    api_key = (
+        os.getenv("GROQ_API_KEY")
+        or st.secrets.get("GROQ_API_KEY", None)
+        or st.session_state.get("groq_api_key", None)
+    )
 
     if not api_key:
         return None
 
     try:
         return Groq(api_key=api_key)
-    except Exception as e:
-        st.error(f"Groq client error: {e}")
+    except Exception:
         return None
     
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500):
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=1200):
     if client is None:
         return None
 
@@ -70,9 +64,27 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500
 
     except Exception as e:
         st.session_state["token_count"]["errors"] += 1
+
+        if "rate_limit" in str(e).lower():
+            st.warning("Rate limit hit. Retrying in 10s...")
+            time.sleep(10)
+
+            try:
+                resp = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                return resp.choices[0].message.content
+            except:
+                pass
+
         st.error(f"LLM Error: {str(e)}")
-        return None
-    
+        return None    
 
 MEMORY_FILE = "review_memory.json"
 ABLATION_CACHE = "ablation_cache.json"
@@ -175,6 +187,66 @@ button[kind="secondary"] {
 </style>
 """, unsafe_allow_html=True)
 
+
+# ══════════════════════════════════════════════════════════════
+# AGENT ROUTER
+# ══════════════════════════════════════════════════════════════
+
+def agent_router_decision(code: str):
+    """Query AgentRouter API to decide which specialist agents to run.
+
+    Falls back to running all agents if the API key is missing or the call fails.
+    Returns a dict with boolean flags for each agent.
+    """
+    api_key = (
+        st.secrets.get("AGENT_ROUTER_API_KEY")
+        or os.getenv("AGENT_ROUTER_API_KEY")
+    )
+
+    if not api_key:
+        st.warning("Agent Router key not found, using fallback routing (all agents)")
+        return {
+            "use_security": True,
+            "use_correctness": True,
+            "use_synth": True,
+            "use_single": True
+        }
+
+    try:
+        response = requests.post(
+            "https://agentrouter.org/api/v1/route",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "input": code[:2000],
+                "task": "code_review"
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        decision = data.get("decision", {})
+
+        result = {
+            "use_security": decision.get("security", True),
+            "use_correctness": decision.get("correctness", True),
+            "use_synth": decision.get("synth", True),
+            "use_single": False   # default OFF to save tokens
+        }
+
+        return result
+
+    except Exception as e:
+        st.warning(f"Agent Router failed ({e}), using fallback routing (all agents)")
+        return {
+            "use_security": True,
+            "use_correctness": True,
+            "use_synth": True,
+            "use_single": True
+        }
 
 # ══════════════════════════════════════════════════════════════
 # STATIC ANALYSIS
@@ -343,42 +415,9 @@ def fix_agent(client, code, review):
 def llm_as_judge(client, code, review):
     truncated = review[:2000] if len(review) > 2000 else review
     return call_llm(client,
-       """You are a VERY STRICT code review evaluator.
-
-Evaluate the review on:
-1. completeness
-2. accuracy
-3. actionability
-4. prioritization
-5. low_hallucination
-
-Scoring rules:
-- 5 = near perfect (rare, almost never give this)
-- 4 = good but has minor issues
-- 3 = average, missing important aspects
-- 2 = weak, vague or incomplete
-- 1 = poor, incorrect or misleading
-
-STRICT PENALTIES:
-- Deduct points for false positives
-- Deduct for vague or generic suggestions
-- Deduct for redundant or repeated issues
-- Deduct if findings are not clearly actionable
-
-IMPORTANT:
-- Do NOT give high scores easily
-- Most real reviews should fall between 15–22 total
-- Only exceptional reviews should exceed 22
-
-Return ONLY JSON:
-{"completeness":{"score":X,"note":"..."},
- "accuracy":{"score":X,"note":"..."},
- "actionability":{"score":X,"note":"..."},
- "prioritization":{"score":X,"note":"..."},
- "low_hallucination":{"score":X,"note":"..."},
- "total":X,
- "max":25}
-""",
+        """Rate this code review 1-5 on: completeness, accuracy, actionability, prioritization, low_hallucination.
+Be strict. Return ONLY JSON:
+{"completeness":{"score":X,"note":"..."},"accuracy":{"score":X,"note":"..."},"actionability":{"score":X,"note":"..."},"prioritization":{"score":X,"note":"..."},"low_hallucination":{"score":X,"note":"..."},"total":X,"max":25}""",
         f"Code:\n```\n{code}\n```\nReview:\n{truncated}\n\nRate. JSON only.",
         temperature=0, max_tokens=400)
 
@@ -442,9 +481,6 @@ def count_findings(text):
 # ══════════════════════════════════════════════════════════════
 
 def extract_keywords(text):
-    if not text:
-        return set()
-
     text = text.lower()
     keywords = []
 
@@ -470,15 +506,8 @@ def extract_keywords(text):
     ]
 
     for label, patterns in mapping:
-        for p in patterns:
-            try:
-                if re.search(p, text):
-                    keywords.append(label)
-                    break
-            except re.error:
-                if p in text:
-                    keywords.append(label)
-                    break
+        if any(re.search(p, text) for p in patterns):
+            keywords.append(label)
 
     return set(keywords)
 
@@ -1113,7 +1142,6 @@ with tab1:
                 st.stop()
 
             client = get_client()
-            st.write("Client:", client)
             if not client:
                 st.error("API key not found.")
             else:
@@ -1121,8 +1149,12 @@ with tab1:
                 for k in ["review_results", "fixed_code", "last_review", "last_code"]:
                     st.session_state.pop(k, None)
 
-                code_input = code_input[:3000]
+                code_input = code_input[:6000]
                 start_time = time.time()
+
+                # ── Agent Router Decision ──────────────────────
+                route = agent_router_decision(code_input)
+                st.write("**Agent Router Decision:**", route)
 
                 st.divider()
                 progress = st.progress(0)
@@ -1132,37 +1164,34 @@ with tab1:
                 tool_findings = tool_agent(code_input)
                 progress.progress(20)
 
-                status.info("🛡️ Step 2/5: Security Reviewer...")
-                API_DELAY = 8
-                sec_review = security_reviewer(client, code_input, tool_findings)
+                # ── Security Reviewer (routed) ─────────────────
+                API_DELAY = 5
+                if route["use_security"]:
+                    status.info("🛡️ Step 2/5: Security Reviewer...")
+                    sec_review = security_reviewer(client, code_input, tool_findings)
+                    if sec_review is None:
+                        st.error("Security reviewer failed")
+                        st.stop()
+                    time.sleep(API_DELAY)
+                else:
+                    st.info("⏭️ Security Reviewer skipped by router")
+                    sec_review = "Skipped by router"
+                progress.progress(40)
 
-                if sec_review is None:
-                    st.error("Security reviewer failed (rate limit or API issue)")
-                    st.stop()                
-                st.write("SEC REVIEW:", sec_review[:200] if sec_review else "None")  
-
-
-                if sec_review is None:
-                    st.error("Security reviewer failed")
-                    st.stop()
-
-                status.info("🐛 Step 3/5: Correctness Reviewer...")
-                corr_review = correctness_reviewer(client, code_input, tool_findings) 
-                if corr_review is None:
-                    st.error("Correctness reviewer failed")
-                    st.stop()
-
-                time.sleep(API_DELAY)
+                # ── Correctness Reviewer (routed) ──────────────
+                if route["use_correctness"]:
+                    status.info("🐛 Step 3/5: Correctness Reviewer...")
+                    corr_review = correctness_reviewer(client, code_input, tool_findings) or ""
+                    time.sleep(API_DELAY)
+                else:
+                    st.info("⏭️ Correctness Reviewer skipped by router")
+                    corr_review = "Skipped by router"
                 progress.progress(60)
 
                 status.info("📝 Step 4/5: Synthesizing...")
                 final_review = ""
                 if sec_review or corr_review:
-                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) 
-                    if final_review is None:
-                        st.error("Synthesizer failed")
-                        st.stop()
-
+                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) or ""
                 if not final_review:
                     parts = []
                     if sec_review: parts.append(f"## Security\n{sec_review}")
@@ -1172,10 +1201,7 @@ with tab1:
                 time.sleep(API_DELAY)
 
                 status.info("👤 Step 5/5: Single agent baseline...")
-                single_out = single_agent_review(client, code_input) 
-                if single_out is None:
-                    st.error("Single agent failed")
-                    st.stop()
+                single_out = single_agent_review(client, code_input) or "Rate limited."
                 progress.progress(100)
                 elapsed = round(time.time() - start_time, 1)
                 status.success(f"Done! ({elapsed}s)")
@@ -1319,7 +1345,6 @@ with tab1:
 
             if gt:
                 # Ground truth comparison bar chart
-                ct = chart_theme()
                 gt_fig = go.Figure()
                 gt_fig.add_trace(go.Bar(
                     name='Precision',
@@ -1351,11 +1376,7 @@ with tab1:
                     yaxis_title="Score",
                     yaxis=dict(range=[0, 1.1]),
                     height=350,
-                    template=ct["template"],
-                    paper_bgcolor=ct["paper_bgcolor"],
-                    plot_bgcolor=ct["plot_bgcolor"],
-                    font=ct["font"],
-                    legend=ct["legend"],
+                    **ct
                 )
                 st.plotly_chart(gt_fig, use_container_width=True)
 
@@ -1388,12 +1409,8 @@ with tab1:
                     title=f"False Positives on Clean Code ({sample_name})",
                     yaxis_title="Count",
                     height=300,
-                    template=ct["template"],
-                    paper_bgcolor=ct["paper_bgcolor"],
-                    plot_bgcolor=ct["plot_bgcolor"],
-                    font=ct["font"],
-                    legend=ct["legend"],
-                )               
+                    **ct
+                )
                 st.plotly_chart(fp_chart, use_container_width=True)
                 if sa_metrics['fp'] == 0 and ma_metrics['fp'] == 0:
                     st.success("Neither agent hallucinated issues on clean code!")
