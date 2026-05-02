@@ -1255,6 +1255,7 @@ with tab1:
 
             if gt:
                 # Ground truth comparison bar chart
+                ct = chart_theme()
                 gt_fig = go.Figure()
                 gt_fig.add_trace(go.Bar(
                     name='Precision',
