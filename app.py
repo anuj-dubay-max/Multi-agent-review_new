@@ -426,8 +426,15 @@ def extract_keywords(text):
     ]
 
     for label, patterns in mapping:
-        if any(re.search(p, text) for p in patterns):
-            keywords.append(label)
+        for p in patterns:
+            try:
+                if re.search(p, text):
+                    keywords.append(label)
+                    break
+            except re.error:
+                if p in text:
+                    keywords.append(label)
+                    break
 
     return set(keywords)
 
