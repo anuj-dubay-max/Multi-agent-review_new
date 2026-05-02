@@ -70,7 +70,8 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=120
 
     except Exception as e:
         st.session_state["token_count"]["errors"] += 1
-        return f"LLM Error: {str(e)}"
+        st.error(f"LLM Error: {str(e)}")
+        return None
     
 
 MEMORY_FILE = "review_memory.json"
@@ -1129,20 +1130,25 @@ with tab1:
                 progress.progress(20)
 
                 status.info("🛡️ Step 2/5: Security Reviewer...")
-                API_DELAY = 5
-                sec_review = security_reviewer(client, code_input, tool_findings) or ""
-                time.sleep(API_DELAY)
-                progress.progress(40)
+                API_DELAY = 8
+                sec_review = security_reviewer(client, code_input, tool_findings)
+                
+                st.write("SEC REVIEW:", sec_review[:200] if sec_review else "None")  
+
+
+                if sec_review is None:
+                    st.error("Security reviewer failed")
+                    st.stop()
 
                 status.info("🐛 Step 3/5: Correctness Reviewer...")
-                corr_review = correctness_reviewer(client, code_input, tool_findings) or ""
+                corr_review = correctness_reviewer(client, code_input, tool_findings) 
                 time.sleep(API_DELAY)
                 progress.progress(60)
 
                 status.info("📝 Step 4/5: Synthesizing...")
                 final_review = ""
                 if sec_review or corr_review:
-                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) or ""
+                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) 
                 if not final_review:
                     parts = []
                     if sec_review: parts.append(f"## Security\n{sec_review}")
@@ -1152,7 +1158,7 @@ with tab1:
                 time.sleep(API_DELAY)
 
                 status.info("👤 Step 5/5: Single agent baseline...")
-                single_out = single_agent_review(client, code_input) or "Rate limited."
+                single_out = single_agent_review(client, code_input) 
                 progress.progress(100)
                 elapsed = round(time.time() - start_time, 1)
                 status.success(f"Done! ({elapsed}s)")
