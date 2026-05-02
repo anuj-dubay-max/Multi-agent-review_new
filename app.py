@@ -335,9 +335,42 @@ def fix_agent(client, code, review):
 def llm_as_judge(client, code, review):
     truncated = review[:2000] if len(review) > 2000 else review
     return call_llm(client,
-        """Rate this code review 1-5 on: completeness, accuracy, actionability, prioritization, low_hallucination.
-Be strict. Return ONLY JSON:
-{"completeness":{"score":X,"note":"..."},"accuracy":{"score":X,"note":"..."},"actionability":{"score":X,"note":"..."},"prioritization":{"score":X,"note":"..."},"low_hallucination":{"score":X,"note":"..."},"total":X,"max":25}""",
+       """You are a VERY STRICT code review evaluator.
+
+Evaluate the review on:
+1. completeness
+2. accuracy
+3. actionability
+4. prioritization
+5. low_hallucination
+
+Scoring rules:
+- 5 = near perfect (rare, almost never give this)
+- 4 = good but has minor issues
+- 3 = average, missing important aspects
+- 2 = weak, vague or incomplete
+- 1 = poor, incorrect or misleading
+
+STRICT PENALTIES:
+- Deduct points for false positives
+- Deduct for vague or generic suggestions
+- Deduct for redundant or repeated issues
+- Deduct if findings are not clearly actionable
+
+IMPORTANT:
+- Do NOT give high scores easily
+- Most real reviews should fall between 15–22 total
+- Only exceptional reviews should exceed 22
+
+Return ONLY JSON:
+{"completeness":{"score":X,"note":"..."},
+ "accuracy":{"score":X,"note":"..."},
+ "actionability":{"score":X,"note":"..."},
+ "prioritization":{"score":X,"note":"..."},
+ "low_hallucination":{"score":X,"note":"..."},
+ "total":X,
+ "max":25}
+""",
         f"Code:\n```\n{code}\n```\nReview:\n{truncated}\n\nRate. JSON only.",
         temperature=0, max_tokens=400)
 
