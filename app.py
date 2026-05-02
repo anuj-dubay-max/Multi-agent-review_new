@@ -43,7 +43,7 @@ def get_client():
         st.error(f"Groq client error: {e}")
         return None
     
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=800):
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500):
     if client is None:
         return None
 
