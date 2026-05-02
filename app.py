@@ -37,7 +37,7 @@ def get_client():
     except Exception:
         return None
     
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=1200):
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500):
     if client is None:
         return None
 
@@ -63,7 +63,39 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=120
         return resp.choices[0].message.content
 
     except Exception as e:
+        err = str(e).lower()
+
+        if "rate_limit" in err or "429" in err:
+            st.warning("Rate limit hit. Retrying in 10s...")
+            time.sleep(10)
+
+            try:
+                resp = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+
+                st.session_state["token_count"]["calls"] += 1
+
+                try:
+                    used = resp.usage.total_tokens
+                    st.session_state["token_count"]["total"] += used
+                except:
+                    pass
+
+                return resp.choices[0].message.content
+
+            except:
+                pass
+
         st.session_state["token_count"]["errors"] += 1
+        st.error(f"LLM Error: {str(e)}")
+        return None
 
         if "rate_limit" in str(e).lower():
             st.warning("Rate limit hit. Retrying in 10s...")
@@ -1140,6 +1172,7 @@ with tab1:
             if st.session_state["token_count"]["errors"] > 8:
                 st.error("Too many recent errors. Wait 60 seconds, then click Clear Results.")
                 st.stop()
+                
 
             client = get_client()
             if not client:
@@ -1149,7 +1182,7 @@ with tab1:
                 for k in ["review_results", "fixed_code", "last_review", "last_code"]:
                     st.session_state.pop(k, None)
 
-                code_input = code_input[:6000]
+                code_input = code_input[:2000]
                 start_time = time.time()
 
                 # ── Agent Router Decision ──────────────────────
@@ -1181,7 +1214,7 @@ with tab1:
                 # ── Correctness Reviewer (routed) ──────────────
                 if route["use_correctness"]:
                     status.info("🐛 Step 3/5: Correctness Reviewer...")
-                    corr_review = correctness_reviewer(client, code_input, tool_findings) or ""
+                    corr_review = correctness_reviewer(client, code_input, tool_findings)
                     time.sleep(API_DELAY)
                 else:
                     st.info("⏭️ Correctness Reviewer skipped by router")
@@ -1191,7 +1224,7 @@ with tab1:
                 status.info("📝 Step 4/5: Synthesizing...")
                 final_review = ""
                 if sec_review or corr_review:
-                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) or ""
+                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) 
                 if not final_review:
                     parts = []
                     if sec_review: parts.append(f"## Security\n{sec_review}")
@@ -1201,7 +1234,7 @@ with tab1:
                 time.sleep(API_DELAY)
 
                 status.info("👤 Step 5/5: Single agent baseline...")
-                single_out = single_agent_review(client, code_input) or "Rate limited."
+                single_out = single_agent_review(client, code_input) 
                 progress.progress(100)
                 elapsed = round(time.time() - start_time, 1)
                 status.success(f"Done! ({elapsed}s)")
