@@ -43,7 +43,7 @@ def get_client():
         st.error(f"Groq client error: {e}")
         return None
     
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=1200):
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=800):
     if client is None:
         return None
 
@@ -442,6 +442,9 @@ def count_findings(text):
 # ══════════════════════════════════════════════════════════════
 
 def extract_keywords(text):
+    if not text:
+        return set()
+
     text = text.lower()
     keywords = []
 
@@ -1118,7 +1121,7 @@ with tab1:
                 for k in ["review_results", "fixed_code", "last_review", "last_code"]:
                     st.session_state.pop(k, None)
 
-                code_input = code_input[:6000]
+                code_input = code_input[:3000]
                 start_time = time.time()
 
                 st.divider()
@@ -1132,7 +1135,10 @@ with tab1:
                 status.info("🛡️ Step 2/5: Security Reviewer...")
                 API_DELAY = 8
                 sec_review = security_reviewer(client, code_input, tool_findings)
-                
+
+                if sec_review is None:
+                    st.error("Security reviewer failed (rate limit or API issue)")
+                    st.stop()                
                 st.write("SEC REVIEW:", sec_review[:200] if sec_review else "None")  
 
 
@@ -1142,6 +1148,10 @@ with tab1:
 
                 status.info("🐛 Step 3/5: Correctness Reviewer...")
                 corr_review = correctness_reviewer(client, code_input, tool_findings) 
+                if corr_review is None:
+                    st.error("Correctness reviewer failed")
+                    st.stop()
+
                 time.sleep(API_DELAY)
                 progress.progress(60)
 
@@ -1149,6 +1159,10 @@ with tab1:
                 final_review = ""
                 if sec_review or corr_review:
                     final_review = synthesizer(client, sec_review, corr_review, tool_findings) 
+                    if final_review is None:
+                        st.error("Synthesizer failed")
+                        st.stop()
+
                 if not final_review:
                     parts = []
                     if sec_review: parts.append(f"## Security\n{sec_review}")
@@ -1159,6 +1173,9 @@ with tab1:
 
                 status.info("👤 Step 5/5: Single agent baseline...")
                 single_out = single_agent_review(client, code_input) 
+                if single_out is None:
+                    st.error("Single agent failed")
+                    st.stop()
                 progress.progress(100)
                 elapsed = round(time.time() - start_time, 1)
                 status.success(f"Done! ({elapsed}s)")
