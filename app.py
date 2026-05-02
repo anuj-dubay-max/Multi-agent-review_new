@@ -1287,7 +1287,11 @@ with tab1:
                     yaxis_title="Score",
                     yaxis=dict(range=[0, 1.1]),
                     height=350,
-                    **ct
+                    template=ct["template"],
+                    paper_bgcolor=ct["paper_bgcolor"],
+                    plot_bgcolor=ct["plot_bgcolor"],
+                    font=ct["font"],
+                    legend=ct["legend"],
                 )
                 st.plotly_chart(gt_fig, use_container_width=True)
 
@@ -1320,8 +1324,12 @@ with tab1:
                     title=f"False Positives on Clean Code ({sample_name})",
                     yaxis_title="Count",
                     height=300,
-                    **ct
-                )
+                    template=ct["template"],
+                    paper_bgcolor=ct["paper_bgcolor"],
+                    plot_bgcolor=ct["plot_bgcolor"],
+                    font=ct["font"],
+                    legend=ct["legend"],
+                )               
                 st.plotly_chart(fp_chart, use_container_width=True)
                 if sa_metrics['fp'] == 0 and ma_metrics['fp'] == 0:
                     st.success("Neither agent hallucinated issues on clean code!")
