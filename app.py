@@ -1,0 +1,1591 @@
+# -*- coding: utf-8 -*-
+"""
+Multi-Agent Code Review Pipeline 
+Approx 4 LLM calls per review (+ optional Fix Agent + Judge)
+"""
+
+import streamlit as st
+import json
+import os
+import re
+import ast
+import hashlib
+import time
+import difflib
+from datetime import datetime
+from groq import Groq
+from dotenv import load_dotenv
+import plotly.graph_objects as go
+
+
+
+load_dotenv()
+
+def get_client():
+    api_key = (
+        os.getenv("GROQ_API_KEY")
+        or st.secrets.get("GROQ_API_KEY", None)
+        or st.session_state.get("groq_api_key", None)
+    )
+
+    if not api_key:
+        return None
+
+    try:
+        return Groq(api_key=api_key)
+    except Exception:
+        return None
+    
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=1200):
+    if client is None:
+        return None
+
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+
+        st.session_state["token_count"]["calls"] += 1
+
+        try:
+            used = resp.usage.total_tokens
+            st.session_state["token_count"]["total"] += used
+        except:
+            pass
+
+        return resp.choices[0].message.content
+
+    except Exception as e:
+        st.session_state["token_count"]["errors"] += 1
+        return f"LLM Error: {str(e)}"
+    
+
+MEMORY_FILE = "review_memory.json"
+ABLATION_CACHE = "ablation_cache.json"
+
+st.set_page_config(page_title="Multi-Agent Code Review", page_icon="🔍", layout="wide")
+
+if "token_count" not in st.session_state:
+    st.session_state["token_count"] = {
+        "total": 0,
+        "calls": 0,
+        "errors": 0
+    }
+
+st.markdown("""
+<style>
+/* ══ FORCE FULL LIGHT THEME ══ */
+html, body,
+[data-testid="stApp"],
+[data-testid="stAppViewContainer"],
+[data-testid="stHeader"],
+[data-testid="stMainBlockContainer"],
+[data-testid="stVerticalBlock"],
+section.main, .main, .block-container {
+    background-color: #ffffff !important;
+    color: #111111 !important;
+}
+[data-testid="stSidebar"],
+[data-testid="stSidebarContent"],
+[data-testid="stSidebarUserContent"] {
+    background-color: #f0f2f6 !important;
+}
+* { color: #111111 !important; }
+pre, code,
+[data-testid="stCode"] pre,
+[data-testid="stCode"] code,
+.stCodeBlock pre, .stCodeBlock code,
+div[class*="stCode"] pre, div[class*="stCode"] code {
+    background-color: #f4f4f4 !important;
+    color: #222222 !important;
+    border-radius: 8px !important;
+}
+[data-testid="stCode"],
+.stCodeBlock,
+div[class*="stCode"] {
+    background-color: #f4f4f4 !important;
+}
+textarea, input[type="text"], input[type="password"] {
+    background-color: #f8f9fa !important;
+    color: #111111 !important;
+    border: 1px solid #cccccc !important;
+}
+[data-baseweb="select"] > div,
+[data-baseweb="popover"],
+[role="listbox"], [role="option"] {
+    background-color: #ffffff !important;
+    color: #111111 !important;
+}
+[data-testid="stFileUploader"],
+[data-testid="stFileUploadDropzone"] {
+    background-color: #f8f9fa !important;
+    border-color: #cccccc !important;
+}
+[data-baseweb="tab-list"] { background-color: #ffffff !important; }
+button[data-baseweb="tab"] {
+    font-size: 1rem !important;
+    font-weight: 600 !important;
+    background-color: transparent !important;
+}
+button { border-radius: 10px !important; }
+table { background-color: #ffffff !important; }
+th    { background-color: #f0f2f6 !important; }
+hr    { border-color: #dddddd !important; }
+[data-testid="stMainBlockContainer"] { padding-top: 2rem !important; max-width: 1200px !important; }
+h1 { font-size: 2.4rem !important; }
+h2 { font-size: 2rem   !important; }
+h3 { font-size: 1.6rem !important; }
+/* File uploader */
+[data-testid="stFileUploadDropzone"] {
+    background-color: #f8f9fa !important;
+    border: 2px dashed #cccccc !important;
+}
+[data-testid="stFileUploadDropzone"] * {
+    color: #111111 !important;
+}
+
+/* Dark buttons → light */
+[data-testid="baseButton-secondary"],
+button[kind="secondary"] {
+    background-color: #f0f2f6 !important;
+    color: #111111 !important;
+    border: 1px solid #cccccc !important;
+}
+
+/* Code textarea (paste your code box) */
+[data-testid="stTextArea"] textarea,
+.stTextArea textarea {
+    background-color: #f8f9fa !important;
+    color: #111111 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# STATIC ANALYSIS
+# ══════════════════════════════════════════════════════════════
+
+def tool_agent(code):
+    findings = []
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                branches = sum(1 for _ in ast.walk(node) if isinstance(_, (ast.If, ast.While, ast.For, ast.ExceptHandler)))
+                if branches > 10:
+                    findings.append({"type": "complexity", "severity": "warning",
+                        "location": f"Function '{node.name}' (line {node.lineno})",
+                        "message": f"High cyclomatic complexity (~{branches} branches).", "agent": "AST"})
+                if len(node.args.args) > 5:
+                    findings.append({"type": "style", "severity": "style",
+                        "location": f"Function '{node.name}' (line {node.lineno})",
+                        "message": f"{len(node.args.args)} parameters.", "agent": "AST"})
+                if not ast.get_docstring(node) and not node.name.startswith("_"):
+                    findings.append({"type": "documentation", "severity": "info",
+                        "location": f"Function '{node.name}' (line {node.lineno})",
+                        "message": "Missing docstring.", "agent": "AST"})
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                findings.append({"type": "bug_risk", "severity": "warning",
+                    "location": f"Line {node.lineno}", "message": "Bare except.", "agent": "AST"})
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                for default in node.args.defaults:
+                    if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                        findings.append({"type": "bug_risk", "severity": "critical",
+                            "location": f"Function '{node.name}' (line {node.lineno})",
+                            "message": "Mutable default argument.", "agent": "AST"})
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                findings.append({"type": "style", "severity": "warning",
+                    "location": f"Line {node.lineno}",
+                    "message": f"Global: {', '.join(node.names)}.", "agent": "AST"})
+    except SyntaxError as e:
+        findings.append({"type": "syntax", "severity": "critical",
+            "location": f"Line {e.lineno}", "message": f"Syntax Error: {e.msg}", "agent": "AST"})
+    # Security patterns
+    patterns = [
+        (r'eval\s*\(', "eval()", "critical", "eval() is dangerous."),
+        (r'exec\s*\(', "exec()", "critical", "exec() arbitrary code."),
+        (r'os\.system\s*\(', "os.system()", "critical", "Command injection."),
+        (r'pickle\.loads?\s*\(', "pickle", "critical", "Arbitrary code execution."),
+        (r'subprocess\.call\s*\(.*shell\s*=\s*True', "shell=True", "critical", "Command injection."),
+        (r'password\s*=\s*["\'][^"\']+["\']', "Hardcoded password", "critical", "Use env vars."),
+        (r'api_key\s*=\s*["\'][^"\']+["\']', "Hardcoded API key", "critical", "Use env vars."),
+        (r'SELECT.*FROM.*WHERE.*\+', "SQL injection", "critical", "Use parameterized queries."),
+        (r'assert\s+', "assert in production", "warning", "Removed with -O flag."),
+        (r'torch\.load\s*\([^)]*\)(?!.*weights_only)', "torch.load() unsafe", "critical", "Use weights_only=True."),
+    ]
+    for i, line in enumerate(code.split('\n'), 1):
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue
+        for pattern, name, severity, message in patterns:
+            if re.search(pattern, stripped, re.IGNORECASE):
+                findings.append({"type": "security", "severity": severity,
+                    "location": f"Line {i}", "message": f"{name}: {message}", "agent": "Scanner"})
+    return findings
+
+# ══════════════════════════════════════════════════════════════
+# AGENTS (4 LLM calls for review + 1 for single baseline = 5)
+# ══════════════════════════════════════════════════════════════
+
+def security_reviewer(client, code, tool_findings):
+    tool_summary = "\n".join(f"- [{f['severity'].upper()}] {f['location']}: {f['message']}"
+        for f in tool_findings if f['type'] == 'security')
+    return call_llm(client,
+        """You are a Security Reviewer.
+
+Find ONLY real OWASP/security vulnerabilities in the code.
+Prioritize exploitability and impact.
+Ignore style, readability, and non-security issues.
+
+For each finding provide:
+1. line number
+2. severity (CRITICAL/WARNING/INFO)
+3. vulnerability type
+4. short explanation
+5. specific secure fix with code
+
+Do NOT hallucinate issues.
+Return numbered list.""",
+        f"Code:\n```\n{code}\n```\nScanner found:\n{tool_summary if tool_summary else 'None'}\n\nSecurity review:")
+
+def correctness_reviewer(client, code, tool_findings):
+    tool_summary = "\n".join(f"- [{f['severity'].upper()}] {f['location']}: {f['message']}"
+        for f in tool_findings if f['type'] in ('bug_risk', 'complexity', 'syntax'))
+    return call_llm(client,
+        """You are a Correctness Reviewer.
+
+Find ONLY runtime bugs, logic flaws, edge cases, data errors, and maintainability risks.
+Ignore security vulnerabilities and style-only comments.
+
+For each finding provide:
+1. line number
+2. severity
+3. what is wrong
+4. failure scenario
+5. exact fix with code
+
+Do NOT hallucinate issues.
+Return numbered list.""",
+        f"Code:\n```\n{code}\n```\nScanner found:\n{tool_summary if tool_summary else 'None'}\n\nCorrectness review:")
+
+def synthesizer(client, sec_review, corr_review, tool_findings):
+    return call_llm(
+        client,
+        """Combine these reviews into ONE final review.
+
+Rules:
+- Keep unique findings from BOTH Security and Correctness reviewers.
+- Remove only true duplicates.
+- Do NOT drop minority findings unless clearly false.
+- Prioritize CRITICAL first, then WARNING, then INFO.
+- Preserve specific fixes.
+- Prefer precise technical wording over generic summaries.
+
+Format each finding as:
+
+### [SEVERITY] Title
+**Location:** line X
+**Confidence:** HIGH / MEDIUM / LOW
+**Source:** Security / Correctness / Both
+**Description:** ...
+**Fix:** ```python ... ```
+
+End with:
+
+## Summary
+X critical, Y warnings, Z info.
+Overall Risk: SAFE / NEEDS CHANGES / CRITICAL ISSUES
+""",
+        f"""Security Review:
+{sec_review}
+
+Correctness Review:
+{corr_review}
+
+Tool Findings:
+{json.dumps(tool_findings, indent=2) if tool_findings else "None"}
+
+Create final review."""
+    )
+def single_agent_review(client, code):
+    return call_llm(client,
+        "You are a general software reviewer. Review the code and list major issues only.",
+        f"Review this code:\n```\n{code}\n```")
+
+def fix_agent(client, code, review):
+    return call_llm(client,
+        "Rewrite the COMPLETE corrected code. Fix all critical/warning issues. Add comments explaining changes. Return ONLY the corrected Python code.",
+        f"Original:\n```python\n{code}\n```\n\nFindings:\n{review}\n\nFixed code:",
+        temperature=0.2, max_tokens=4000)
+
+# ══════════════════════════════════════════════════════════════
+# JUDGE (manual only, 2 calls)
+# ══════════════════════════════════════════════════════════════
+
+def llm_as_judge(client, code, review):
+    truncated = review[:2000] if len(review) > 2000 else review
+    return call_llm(client,
+        """Rate this code review 1-5 on: completeness, accuracy, actionability, prioritization, low_hallucination.
+Be strict. Return ONLY JSON:
+{"completeness":{"score":X,"note":"..."},"accuracy":{"score":X,"note":"..."},"actionability":{"score":X,"note":"..."},"prioritization":{"score":X,"note":"..."},"low_hallucination":{"score":X,"note":"..."},"total":X,"max":25}""",
+        f"Code:\n```\n{code}\n```\nReview:\n{truncated}\n\nRate. JSON only.",
+        temperature=0, max_tokens=400)
+
+def parse_judge_score(raw):
+    if raw is None:
+        return None
+    try:
+        clean = raw.strip().replace("```json", "").replace("```", "").strip()
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            return None
+        data = json.loads(clean[start:end])
+        dims = ["completeness", "accuracy", "actionability", "prioritization", "low_hallucination"]
+        total = 0
+        for d in dims:
+            s = int(data[d]["score"])
+            s = max(1, min(s, 5))
+            data[d]["score"] = s
+            total += s
+        data["total"] = total
+        data["max"] = 25
+        return data
+    except:
+        return None
+
+def count_findings(text):
+    if not text:
+        return {"critical":0,"warning":0,"style":0,"info":0,"total":0}
+
+    c = max(
+        len(re.findall(r'\bCRITICAL\b', text)),
+        len(re.findall(r'(?i)(sql injection|command injection|hardcoded|pickle|arbitrary code|secret)', text))
+    )
+
+    w = max(
+        len(re.findall(r'\bWARNING\b', text)),
+        len(re.findall(r'(?i)(mutable default|unsafe|assert.*production|bug risk|edge case|vulnerable)', text))
+    )
+
+    s = max(
+        len(re.findall(r'\bSTYLE\b', text)),
+        len(re.findall(r'(?i)(type hint|docstring|naming|readability|maintainability|refactor|clean code|modular|duplicate code)', text))
+    )
+
+    i = max(
+        len(re.findall(r'\bINFO\b', text)),
+        len(re.findall(r'(?i)(consider|suggestion|recommendation|optional|note|improvement)', text))
+    )
+
+    return {
+        "critical": c,
+        "warning": w,
+        "style": s,
+        "info": i,
+        "total": c+w+s+i
+    }
+
+# ══════════════════════════════════════════════════════════════
+# STEP 2 — Extract findings cleanly
+# ══════════════════════════════════════════════════════════════
+
+def extract_keywords(text):
+    text = text.lower()
+    keywords = []
+
+    mapping = [
+        ("sql injection", ["sql injection", "unsanitized query", "string concatenation.*query", "parameterized"]),
+        ("pickle", ["pickle", "deserialization"]),
+        ("os.system", ["os.system", "command injection", "shell injection"]),
+        ("hardcoded credentials", ["hardcoded", "password", "secret", "credential", "plaintext"]),
+        ("mutable default", ["mutable default", "mutable argument", "default argument.*list", "default argument.*dict"]),
+        ("torch.load unsafe", ["torch.load", "unsafe load", "weights_only"]),
+        ("accuracy bug", ["accuracy", "incorrect metric", "wrong calculation"]),
+        ("email validation", ["email validation", "email verification", "invalid email", "email check"]),
+        ("cache issue", ["class.*cache", "shared state", "shared cache", "class-level cache", "class attribute", "class variable"]),
+        ("settingwithcopy", ["settingwithcopy", "setting with copy", "copy warning", "view.*copy", "chained assignment"]),
+        ("assert in production", ["assert", "removed with -o", "optimization flag"]),
+        ("eval usage", ["eval(", "eval is dangerous"]),
+        ("exec usage", ["exec(", "exec is dangerous"]),
+        ("type confusion", ["type confusion", "type mismatch", "wrong type"]),
+        ("integer overflow", ["integer overflow", "overflow", "wrap around"]),
+        ("input validation", ["input validation", "unvalidated input", "sanitize input"]),
+        ("resource leak", ["resource leak", "unclosed", "file not closed", "connection leak"]),
+        ("race condition", ["race condition", "thread safety", "concurrent access"]),
+    ]
+
+    for label, patterns in mapping:
+        if any(re.search(p, text) for p in patterns):
+            keywords.append(label)
+
+    return set(keywords)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 3 — Compute metrics
+# ══════════════════════════════════════════════════════════════
+
+def compute_metrics(predicted, actual):
+    predicted = set(predicted)
+    actual = set(actual)
+
+    tp = len(predicted & actual)
+    fp = len(predicted - actual)
+    fn = len(actual - predicted)
+
+    precision = tp / (tp + fp) if (tp + fp) else 0
+    recall = tp / (tp + fn) if (tp + fn) else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "precision": round(precision, 2),
+        "recall": round(recall, 2),
+        "f1": round(f1, 2)
+    }
+    
+    
+# ══════════════════════════════════════════════════════════════
+# DIFF
+# ══════════════════════════════════════════════════════════════
+
+def generate_diff(original, fixed):
+    diff = difflib.unified_diff(original.splitlines(keepends=True), fixed.splitlines(keepends=True), fromfile="original.py", tofile="fixed.py", n=3)
+    diff_text = "".join(diff)
+    if not diff_text:
+        return None
+    html = []
+    for line in diff_text.splitlines():
+        if line.startswith('+') and not line.startswith('+++'):
+            html.append(f'<div class="diff-add">{line}</div>')
+        elif line.startswith('-') and not line.startswith('---'):
+            html.append(f'<div class="diff-remove">{line}</div>')
+        elif line.startswith('@@'):
+            html.append(f'<div style="color:#888">{line}</div>')
+        else:
+            html.append(f'<div>{line}</div>')
+    return "".join(html)
+
+# ══════════════════════════════════════════════════════════════
+# ABLATION
+# ══════════════════════════════════════════════════════════════
+
+def debate_agent(client, finding_a, finding_b, code):
+    return call_llm(client,
+        """You are a Code Review Arbitrator. Two reviewers analyzed this code.
+1. Findings both agree on (high confidence)
+2. Contradictions
+3. Unique findings (lower confidence)
+4. Likely hallucinations
+Return structured analysis.""",
+        f"Code:\n```\n{code}\n```\nSecurity:\n{finding_a}\n\nCorrectness:\n{finding_b}\n\nArbitrate.")
+
+def verifier_agent(client, code, review):
+    return call_llm(client,
+        """Verify these findings against the actual code. Mark each: VERIFIED / FALSE_POSITIVE.
+Remove false positives. Add: "X/Y verified (Z removed)".""",
+        f"Code:\n```\n{code}\n```\nReview:\n{review}\n\nVerify.")
+
+def run_ablation(client, code, sample_name="sample", progress_cb=None):
+    results = {}
+    DELAY = 6
+
+    if progress_cb: progress_cb("Tool Agent...")
+    tf = tool_agent(code)
+
+    if progress_cb: progress_cb("Single Agent...")
+    single = single_agent_review(client, code)
+    time.sleep(DELAY)
+    if single is None:
+        st.error(f"Rate limit on Single Agent for '{sample_name}'.")
+        return None
+
+    if progress_cb: progress_cb("Security Reviewer...")
+    sec = security_reviewer(client, code, tf)
+    time.sleep(DELAY)
+    if sec is None:
+        st.error(f"Rate limit on Security for '{sample_name}'.")
+        return None
+
+    if progress_cb: progress_cb("Correctness Reviewer...")
+    corr = correctness_reviewer(client, code, tf)
+    time.sleep(DELAY)
+    if corr is None:
+        st.error(f"Rate limit on Correctness for '{sample_name}'.")
+        return None
+
+    if progress_cb: progress_cb("Synthesizer (no debate)...")
+    no_debate = synthesizer(client, sec, corr, tf)
+    time.sleep(DELAY)
+    if no_debate is None:
+        st.error(f"Rate limit on Synthesizer for '{sample_name}'.")
+        return None
+
+    if progress_cb: progress_cb("Debate Agent...")
+    debate = debate_agent(client, sec, corr, code)
+    time.sleep(DELAY)
+
+    if progress_cb: progress_cb("Synthesizer (with debate)...")
+    with_debate = synthesizer(client, debate or sec, corr, tf) if debate else no_debate
+    time.sleep(DELAY)
+
+    if progress_cb: progress_cb("Verifier...")
+    verified = verifier_agent(client, code, with_debate) if with_debate else no_debate
+    time.sleep(DELAY)
+    if verified is None:
+        verified = with_debate
+
+    tool_out = "Static Analysis:\n" + "\n".join(f"[{f['severity'].upper()}] {f['location']}: {f['message']}" for f in tf) if tf else "No issues."
+    configs = {
+        "Single Agent": single,
+        "Tool Only": tool_out,
+        "Tool + Security": sec,
+        "Tool + Sec + Correctness": f"Security:\n{sec}\n\nCorrectness:\n{corr}",
+        "Full (no Debate)": no_debate,
+        "Full + Debate": with_debate,
+        "Full + Debate + Verify": verified,
+    }
+
+    for name, output in configs.items():
+        if progress_cb: progress_cb(f"Judging: {name}...")
+        raw = llm_as_judge(client, code, output)
+        time.sleep(DELAY)
+        scores = parse_judge_score(raw)
+        results[name] = {"avg_score": scores["total"] if scores else None,
+                         "findings": count_findings(output), "output": output}
+
+    # Cache
+    cache = {}
+    if os.path.exists(ABLATION_CACHE):
+        try:
+            with open(ABLATION_CACHE, "r") as f:
+                cache = json.load(f)
+        except Exception:
+            pass
+    cache[sample_name] = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                           "scores": {k: v["avg_score"] for k, v in results.items()},
+                           "findings": {k: v["findings"] for k, v in results.items()}}
+    with open(ABLATION_CACHE, "w") as f:
+        json.dump(cache, f, indent=2)
+    return results
+
+def compute_aggregate(all_results):
+    configs = list(list(all_results.values())[0].keys()) if all_results else []
+    agg = {}
+    for config in configs:
+        per = {}
+        for sname, res in all_results.items():
+            s = res.get(config, {}).get("avg_score")
+            if s is not None:
+                per[sname] = s
+        if per:
+            vals = list(per.values())
+            mean = sum(vals) / len(vals)
+            std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5 if len(vals) > 1 else 0
+            agg[config] = {"mean": round(mean, 1), "std": round(std, 1), "per_sample": per}
+    return agg
+
+# ══════════════════════════════════════════════════════════════
+# MEMORY
+# ══════════════════════════════════════════════════════════════
+
+def save_review(code, s_score, m_score):
+    mem = []
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                mem = json.load(f)
+        except:
+            pass
+    mem.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                 "code_hash": hashlib.md5(code.encode()).hexdigest()[:8],
+                 "code_preview": code[:100], "single_score": s_score, "multi_score": m_score})
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(mem, f, indent=2)
+
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        return []
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return []
+
+# ══════════════════════════════════════════════════════════════
+# SAMPLES
+# ══════════════════════════════════════════════════════════════
+
+SAMPLE_CODES = {
+    "Vulnerable Web App": '''import os
+import pickle
+import sqlite3
+
+def get_user(username):
+    conn = sqlite3.connect("users.db")
+    query = "SELECT * FROM users WHERE username = '" + username + "'"
+    return conn.execute(query).fetchone()
+
+def load_session(data):
+    return pickle.loads(data)
+
+def run_command(cmd):
+    os.system(cmd)
+
+def process_items(items=[]):
+    for item in items:
+        print(item)
+    items.append("processed")
+
+def calculate_discount(price, discount):
+    assert discount >= 0 and discount <= 100
+    return price * (1 - discount / 100)
+
+def authenticate(username, password):
+    if username == "admin" and password == "super_secret_123":
+        return True
+    return False
+''',
+    "Data Pipeline Bug": '''import pandas as pd
+from typing import List
+
+def process_data(df):
+    df = df.dropna()
+    avg = df["value"].mean()
+    result = df[df["value"] > avg]
+    result["percentage"] = result["value"] / result["value"].sum() * 100
+    return result
+
+def validate_email(emails):
+    for email in emails:
+        if "@" in email:
+            return True
+    return False
+
+def chunk_list(data, chunk_size):
+    return [data[i:i+chunk_size] for i in range(0, len(data))]
+
+class DataProcessor:
+    cache = {}
+    def process(self, data):
+        key = str(data)
+        if key in self.cache:
+            return self.cache[key]
+        result = self._expensive_operation(data)
+        self.cache[key] = result
+        return result
+    def _expensive_operation(self, data):
+        total = 0
+        for i in range(1000000):
+            total += i * data
+        return total
+''',
+    "ML Training Script": '''import torch
+import torch.nn as nn
+
+class SimpleModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.layer1 = nn.Linear(input_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        return x
+
+def evaluate(model, test_data):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for x, y in test_data:
+            pred = model(x)
+            predictions.append(pred.argmax().item())
+    accuracy = sum(1 for p, t in zip(predictions, test_data) if p == t[1]) / len(test_data)
+    return accuracy
+
+def load_checkpoint(model, path):
+    model.load_state_dict(torch.load(path))
+    return model
+''',
+    "Clean Utility Module": '''"""Utility functions for data processing."""
+import os
+from typing import Optional, List
+
+
+def read_file(filepath: str) -> Optional[str]:
+    """Read file contents safely."""
+    if not os.path.exists(filepath):
+        return None
+    with open(filepath, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def parse_config(config_str: str) -> dict:
+    """Parse a key=value config string into a dict."""
+    config = {}
+    for line in config_str.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            config[key.strip()] = value.strip()
+    return config
+
+
+def normalize_values(values: List[float]) -> List[float]:
+    """Min-max normalize a list of values to [0, 1]."""
+    if not values:
+        return []
+    min_val = min(values)
+    max_val = max(values)
+    if max_val == min_val:
+        return [0.0] * len(values)
+    return [(v - min_val) / (max_val - min_val) for v in values]
+
+
+def chunk_data(data: list, chunk_size: int) -> List[list]:
+    """Split data into chunks of given size."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+
+
+if __name__ == "__main__":
+    content = read_file("config.txt")
+    if content:
+        cfg = parse_config(content)
+        print(f"Loaded {len(cfg)} config entries")
+''',
+    "REST API Handler": '''import sqlite3
+import hashlib
+import json
+from http.server import BaseHTTPRequestHandler
+
+DB_PATH = "users.db"
+SECRET_KEY = "my_super_secret_key_123"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT UNIQUE,
+        password_hash TEXT,
+        email TEXT
+    )""")
+    conn.commit()
+    conn.close()
+
+def hash_password(password):
+    return hashlib.md5(password.encode()).hexdigest()
+
+def verify_user(username, password):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    query = f"SELECT * FROM users WHERE username='{username}' AND password_hash='{hash_password(password)}'"
+    cursor.execute(query)
+    result = cursor.fetchone()
+    return result is not None
+
+def get_user_profile(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM users WHERE id={user_id}")
+    return cursor.fetchone()
+
+def update_email(user_id, new_email):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE users SET email='{new_email}' WHERE id={user_id}")
+    conn.commit()
+    conn.close()
+
+class APIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/user/"):
+            user_id = self.path.split("/")[2]
+            profile = get_user_profile(user_id)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(profile).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+''',
+    "Concurrent Task Queue": '''import threading
+import time
+from collections import deque
+
+
+class TaskQueue:
+    def __init__(self, max_size=100):
+        self.queue = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+        self.processed = {}
+        self._running = True
+
+    def add_task(self, task_id, task_data):
+        with self.lock:
+            self.queue.append((task_id, task_data))
+            self.processed[task_id] = "pending"
+
+    def get_task(self):
+        if not self.queue:
+            return None
+        with self.lock:
+            return self.queue.popleft()
+
+    def process_all(self):
+        while self._running or self.queue:
+            task = self.get_task()
+            if task is None:
+                time.sleep(0.1)
+                continue
+            task_id, task_data = task
+            try:
+                result = self._execute(task_data)
+                self.processed[task_id] = result
+            except Exception as e:
+                self.processed[task_id] = f"error: {str(e)}"
+
+    def _execute(self, task_data):
+        time.sleep(0.01)
+        if isinstance(task_data, int):
+            return task_data * 2
+        elif isinstance(task_data, str):
+            return task_data.upper()
+        else:
+            return str(task_data)
+
+    def get_status(self, task_id):
+        return self.processed.get(task_id, "not_found")
+
+    def shutdown(self):
+        self._running = False
+
+
+def worker_thread(queue):
+    queue.process_all()
+
+
+if __name__ == "__main__":
+    q = TaskQueue()
+    for i in range(50):
+        q.add_task(f"task_{i}", i)
+
+    threads = []
+    for _ in range(4):
+        t = threading.Thread(target=worker_thread, args=(q,))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=5)
+
+    print(f"Processed {len([s for s in q.processed.values() if s != 'pending'])} tasks")
+'''
+}
+
+# ══════════════════════════════════════════════════════════════
+# STEP 1 — Add ground truth dictionary
+# ══════════════════════════════════════════════════════════════
+
+GROUND_TRUTH = {
+    "Vulnerable Web App": [
+        "sql injection",
+        "pickle",
+        "os.system",
+        "hardcoded credentials",
+        "mutable default",
+        "assert in production"
+    ],
+    "Data Pipeline Bug": [
+        "settingwithcopy",
+        "email validation",
+        "cache issue"
+    ],
+    "ML Training Script": [
+        "accuracy bug",
+        "torch.load unsafe"
+    ],
+    "Clean Utility Module": [
+    ],
+    "REST API Handler": [
+        "input validation",
+        "resource leak",
+        "hardcoded credentials"
+    ],
+    "Concurrent Task Queue": [
+        "race condition",
+        "resource leak",
+        "type confusion"
+    ]
+}
+
+# ══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.markdown("### ⚙️ Setup")
+    if os.getenv("GROQ_API_KEY"):
+        st.success("API key loaded")
+    else:
+        try:
+            if st.secrets.get("GROQ_API_KEY"):
+                st.success("API key loaded")
+        except:
+            if "groq_api_key" not in st.session_state:
+                st.session_state.groq_api_key = ""
+            k = st.text_input("Groq API Key", type="password", value=st.session_state.groq_api_key, key="api_key")
+            if k:
+                st.session_state.groq_api_key = k
+                st.success("Key set")
+            else:
+                st.warning("Enter key")
+
+    st.divider()
+    st.markdown("### 🏗️ Pipeline Config")
+    st.caption("Choose which agents to include")
+
+    use_tools = st.checkbox("Tool Agent", value=True)
+    use_security = st.checkbox("Security Reviewer", value=True)
+    use_correctness = st.checkbox("Correctness Reviewer", value=True)
+    use_synth = st.checkbox("Synthesizer", value=True)
+    use_judge = st.checkbox("Judge (Optional)", value=True)
+
+    st.divider()
+    tc = st.session_state.get("token_count", {"total": 0, "calls": 0, "errors": 0})
+    st.markdown("### 📊 Stats")
+    st.caption(f"Calls: {tc['calls']} | Errors: {tc['errors']} | Tokens: {tc['total']:,}")
+
+    if tc["errors"] > 8:
+        st.error("⚠️ Too many errors. Wait 60s before next run.")
+
+    st.divider()
+    if st.button("🗑️ Clear Results", key="clear_results_btn"):
+        for k in [
+            "review_results",
+            "fixed_code",
+            "last_review",
+            "last_code",
+            "ablation_results"
+        ]:
+            st.session_state.pop(k, None)
+
+        st.session_state["token_count"] = {"total": 0, "calls": 0, "errors": 0}
+        st.rerun()
+
+    st.divider()
+    st.markdown("### 📋 History")
+    mem = load_memory()
+    if mem:
+        for r in reversed(mem[-5:]):
+            st.markdown(f"**`{r['code_hash']}`** S:{r['single_score']}/25 M:{r['multi_score']}/25")
+    else:
+        st.caption("No reviews yet.")
+
+# ══════════════════════════════════════════════════════════════
+# CHART THEME HELPER  ← NEW
+# ══════════════════════════════════════════════════════════════
+
+def chart_theme(_=None):
+    return dict(
+        template="plotly_white",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#f8f9fa",
+        font=dict(color="#111111"),
+        xaxis=dict(gridcolor="#e0e0e0", tickfont=dict(color="#444")),
+        yaxis=dict(gridcolor="#e0e0e0", tickfont=dict(color="#444")),
+        legend=dict(bgcolor="#ffffff", font=dict(color="#111111")),
+    )
+
+# ══════════════════════════════════════════════════════════════
+# MAIN TABS
+# ══════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Code Review", "📊 Ablation Study", "🔬 Methodology", "📖 How It Works"])
+
+# ── TAB 1: CODE REVIEW ──────────────────────────────────────
+
+with tab1:
+    st.markdown('<p class="hero-title">Multi-Agent Code Review</p>', unsafe_allow_html=True)
+    st.markdown('<p class="hero-sub">Approx 4 LLM calls per review (+ Judge separate)</p>', unsafe_allow_html=True)
+
+    sample_choice = st.selectbox(
+        "Load sample",
+        ["None"] + list(SAMPLE_CODES.keys()),
+        key="sample_select"
+    )
+
+    if sample_choice != "None":
+        st.session_state["cr_code"] = SAMPLE_CODES[sample_choice]
+
+    col1, col2 = st.columns([1,3])
+
+    with col1:
+        uploaded_file = st.file_uploader("Upload .py file", type=["py", "txt"])
+
+        if uploaded_file:
+            st.session_state["cr_code"] = uploaded_file.read().decode("utf-8")
+
+    with col2:
+        code_input = st.text_area(
+            "Paste your code",
+            height=420,
+            placeholder="Paste Python code...",
+            key="cr_code"
+        )
+
+    run_btn = st.button("🔍 Run Review (4 LLM calls)", type="primary", use_container_width=True)
+
+    # ── RUN PIPELINE ─────────────────────────────────────────
+    if run_btn:
+        if not code_input.strip():
+            st.error("Paste code first.")
+        else:
+            if st.session_state["token_count"]["errors"] > 8:
+                st.error("Too many recent errors. Wait 60 seconds, then click Clear Results.")
+                st.stop()
+
+            client = get_client()
+            if not client:
+                st.error("API key not found.")
+            else:
+                st.session_state["token_count"] = {"total": 0, "calls": 0, "errors": 0}
+                for k in ["review_results", "fixed_code", "last_review", "last_code"]:
+                    st.session_state.pop(k, None)
+
+                code_input = code_input[:6000]
+                start_time = time.time()
+
+                st.divider()
+                progress = st.progress(0)
+                status = st.empty()
+
+                status.info("🔧 Step 1/5: Tool Agent (instant)...")
+                tool_findings = tool_agent(code_input)
+                progress.progress(20)
+
+                status.info("🛡️ Step 2/5: Security Reviewer...")
+                API_DELAY = 5
+                sec_review = security_reviewer(client, code_input, tool_findings) or ""
+                time.sleep(API_DELAY)
+                progress.progress(40)
+
+                status.info("🐛 Step 3/5: Correctness Reviewer...")
+                corr_review = correctness_reviewer(client, code_input, tool_findings) or ""
+                time.sleep(API_DELAY)
+                progress.progress(60)
+
+                status.info("📝 Step 4/5: Synthesizing...")
+                final_review = ""
+                if sec_review or corr_review:
+                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) or ""
+                if not final_review:
+                    parts = []
+                    if sec_review: parts.append(f"## Security\n{sec_review}")
+                    if corr_review: parts.append(f"## Correctness\n{corr_review}")
+                    final_review = "\n\n---\n\n".join(parts) if parts else "All agents failed. Wait 60s and retry."
+                progress.progress(80)
+                time.sleep(API_DELAY)
+
+                status.info("👤 Step 5/5: Single agent baseline...")
+                single_out = single_agent_review(client, code_input) or "Rate limited."
+                progress.progress(100)
+                elapsed = round(time.time() - start_time, 1)
+                status.success(f"Done! ({elapsed}s)")
+
+                st.session_state["review_results"] = {
+                    "final_review": final_review,
+                    "single_out": single_out,
+                    "tool_findings": tool_findings,
+                    "sec_review": sec_review,
+                    "corr_review": corr_review,
+                    "single_scores": None,
+                    "multi_scores": None,
+                    "elapsed": elapsed,
+                    "code_input": code_input,
+                }
+                st.session_state["last_review"] = final_review
+                st.session_state["last_code"] = code_input
+                st.session_state["fixed_code"] = ""
+
+    # ── DISPLAY RESULTS ──────────────────────────────────────
+    R = st.session_state.get("review_results")
+
+    if R:
+        final_review = R["final_review"]
+        single_out = R["single_out"]
+        tool_findings = R["tool_findings"]
+        sec_review = R.get("sec_review", "")
+        corr_review = R.get("corr_review", "")
+        single_scores = R.get("single_scores")
+        multi_scores = R.get("multi_scores")
+        elapsed = R["elapsed"]
+        code_used = R["code_input"]
+
+        st.divider()
+
+        if tool_findings:
+            st.markdown(f"**Tool Agent: {len(tool_findings)} issues**")
+            for f in tool_findings:
+                st.markdown(f"""<div class="finding-card severity-{f['severity']}">
+                    <span class="sev-badge sev-{f['severity']}">{f['severity']}</span>
+                    <strong>{f['location']}</strong> — {f['message']}</div>""", unsafe_allow_html=True)
+
+        st.markdown("### 📊 Score Comparison")
+
+        if single_scores and multi_scores:
+            sc1, sc2, sc3 = st.columns([5, 2, 5])
+            with sc1:
+                st.markdown(f"""<div class="stat-card" style="border-color:#3a1a1a">
+                    <div class="stat-label">Single Agent</div>
+                    <div class="stat-num" style="color:#e05252">{single_scores['total']}</div>
+                    <div class="stat-label">/ 25</div></div>""", unsafe_allow_html=True)
+                for d in ["completeness", "accuracy", "actionability", "prioritization", "low_hallucination"]:
+                    v = single_scores.get(d, {}).get("score", 0)
+                    n = single_scores.get(d, {}).get("note", "")
+                    st.caption(f"**{d.replace('_',' ').title()}**: {v}/5 — {n}")
+            with sc2:
+                diff = multi_scores['total'] - single_scores['total']
+                c = "#52c478" if diff >= 0 else "#e05252"
+                s = "+" if diff >= 0 else ""
+                st.markdown(f"""<div class="stat-card" style="border-color:#2a2a2a">
+                    <div class="stat-label">Delta</div>
+                    <div class="stat-num" style="color:{c}">{s}{diff}</div></div>""", unsafe_allow_html=True)
+            with sc3:
+                st.markdown(f"""<div class="stat-card" style="border-color:#1a3a1a">
+                    <div class="stat-label">Multi-Agent</div>
+                    <div class="stat-num" style="color:#52c478">{multi_scores['total']}</div>
+                    <div class="stat-label">/ 25</div></div>""", unsafe_allow_html=True)
+                for d in ["completeness", "accuracy", "actionability", "prioritization", "low_hallucination"]:
+                    v = multi_scores.get(d, {}).get("score", 0)
+                    n = multi_scores.get(d, {}).get("note", "")
+                    st.caption(f"**{d.replace('_',' ').title()}**: {v}/5 — {n}")
+
+        else:
+            st.info("👇 Click to evaluate with LLM-as-Judge (2 API calls, may take ~10-20s)")
+
+            if st.button("📊 Evaluate with Judge", type="secondary"):
+                client = get_client()
+                if client:
+                    with st.spinner("Judging single agent..."):
+                        sj = llm_as_judge(client, code_used, single_out)
+                    time.sleep(3)
+                    with st.spinner("Judging multi-agent..."):
+                        mj = llm_as_judge(client, code_used, final_review)
+                    ss = parse_judge_score(sj)
+                    ms = parse_judge_score(mj)
+                    if ss and ms:
+                        R["single_scores"] = ss
+                        R["multi_scores"] = ms
+                        st.session_state["review_results"] = R
+                        save_review(code_used, ss["total"], ms["total"])
+                        st.rerun()
+                    else:
+                        st.error("Judge failed. Wait 30s and try again.")
+                else:
+                    st.error("API key not found.")
+
+        # Finding counts chart
+        st.divider()
+        st.markdown("### 📈 Finding Counts")
+        sf = count_findings(single_out)
+        mf = count_findings(final_review)
+        fig = go.Figure()
+        cats = ['critical', 'warning', 'style', 'info']
+        fig.add_trace(go.Bar(name='Single', x=[c.title() for c in cats],
+            y=[sf.get(c, 0) for c in cats],
+            marker_color=['#ff4444', '#ffaa00', '#4488ff', '#44bb88'], opacity=0.7))
+        fig.add_trace(go.Bar(name='Multi-Agent', x=[c.title() for c in cats],
+            y=[mf.get(c, 0) for c in cats],
+            marker_color=['#ff6666', '#ffcc44', '#6699ff', '#66ddaa']))
+        ct = chart_theme()
+        fig.update_layout(barmode='group', title="Findings by Severity",
+            yaxis_title="Count", height=350, **ct)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ═══════════════════════════════════════════════════════
+        # STEP 4 — Hook into your pipeline (Ground Truth Evaluation)
+        # ═══════════════════════════════════════════════════════
+        sample_name = st.session_state.get("sample_select")
+
+        if sample_name in GROUND_TRUTH:
+            gt = set(GROUND_TRUTH[sample_name])
+
+            sa_preds = extract_keywords(single_out)
+            ma_preds = extract_keywords(final_review)
+
+            sa_metrics = compute_metrics(sa_preds, gt)
+            ma_metrics = compute_metrics(ma_preds, gt)
+
+            st.divider()
+            st.markdown("### 📊 Real Evaluation (Ground Truth)")
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.markdown("**Single Agent**")
+                st.json(sa_metrics)
+
+            with c2:
+                st.markdown("**Multi-Agent**")
+                st.json(ma_metrics)
+
+            if gt:
+                # Ground truth comparison bar chart
+                gt_fig = go.Figure()
+                gt_fig.add_trace(go.Bar(
+                    name='Precision',
+                    x=['Single Agent', 'Multi-Agent'],
+                    y=[sa_metrics['precision'], ma_metrics['precision']],
+                    marker_color=['#e05252', '#52c478'],
+                    text=[f"{sa_metrics['precision']}", f"{ma_metrics['precision']}"],
+                    textposition='outside'
+                ))
+                gt_fig.add_trace(go.Bar(
+                    name='Recall',
+                    x=['Single Agent', 'Multi-Agent'],
+                    y=[sa_metrics['recall'], ma_metrics['recall']],
+                    marker_color=['#f5a623', '#4caf50'],
+                    text=[f"{sa_metrics['recall']}", f"{ma_metrics['recall']}"],
+                    textposition='outside'
+                ))
+                gt_fig.add_trace(go.Bar(
+                    name='F1',
+                    x=['Single Agent', 'Multi-Agent'],
+                    y=[sa_metrics['f1'], ma_metrics['f1']],
+                    marker_color=['#9c27b0', '#2196f3'],
+                    text=[f"{sa_metrics['f1']}", f"{ma_metrics['f1']}"],
+                    textposition='outside'
+                ))
+                gt_fig.update_layout(
+                    barmode='group',
+                    title=f"Precision / Recall / F1 vs Ground Truth ({sample_name})",
+                    yaxis_title="Score",
+                    yaxis=dict(range=[0, 1.1]),
+                    height=350,
+                    **ct
+                )
+                st.plotly_chart(gt_fig, use_container_width=True)
+
+                # Show which issues were found/missed
+                st.markdown(f"**Ground Truth Issues:** {', '.join(sorted(gt))}")
+                st.markdown(f"**Single Agent Found:** {', '.join(sorted(sa_preds))}")
+                st.markdown(f"**Multi-Agent Found:** {', '.join(sorted(ma_preds))}")
+
+                missed_by_sa = gt - sa_preds
+                missed_by_ma = gt - ma_preds
+                if missed_by_sa:
+                    st.warning(f"Single Agent missed: {', '.join(sorted(missed_by_sa))}")
+                if missed_by_ma:
+                    st.warning(f"Multi-Agent missed: {', '.join(sorted(missed_by_ma))}")
+                if not missed_by_ma and missed_by_sa:
+                    st.success("Multi-Agent found all ground truth issues!")
+            else:
+                # Clean code sample — measure false positive rate
+                st.info(f"'{sample_name}' is a clean code sample (no known issues). Any findings are false positives.")
+                fp_chart = go.Figure()
+                fp_chart.add_trace(go.Bar(
+                    name='False Positives',
+                    x=['Single Agent', 'Multi-Agent'],
+                    y=[sa_metrics['fp'], ma_metrics['fp']],
+                    marker_color=['#e05252', '#52c478'],
+                    text=[f"{sa_metrics['fp']}", f"{ma_metrics['fp']}"],
+                    textposition='outside'
+                ))
+                fp_chart.update_layout(
+                    title=f"False Positives on Clean Code ({sample_name})",
+                    yaxis_title="Count",
+                    height=300,
+                    **ct
+                )
+                st.plotly_chart(fp_chart, use_container_width=True)
+                if sa_metrics['fp'] == 0 and ma_metrics['fp'] == 0:
+                    st.success("Neither agent hallucinated issues on clean code!")
+                elif ma_metrics['fp'] < sa_metrics['fp']:
+                    st.success(f"Multi-Agent produced fewer false positives ({ma_metrics['fp']} vs {sa_metrics['fp']}).")
+                elif sa_metrics['fp'] < ma_metrics['fp']:
+                    st.warning(f"Single Agent produced fewer false positives ({sa_metrics['fp']} vs {ma_metrics['fp']}).")
+
+            st.caption("Evaluation based on manually defined ground truth labels per sample. Ground truth was constructed by identifying known vulnerability patterns and logical bugs present in each code sample.")
+
+        st.divider()
+        st.markdown("### 📝 Full Reviews")
+        t1, t2, t3, t4 = st.tabs(["🏆 Multi-Agent", "🛡️ Security", "🐛 Correctness", "👤 Single Agent"])
+        with t1: st.markdown(final_review)
+        with t2: st.markdown(sec_review)
+        with t3: st.markdown(corr_review)
+        with t4: st.markdown(single_out)
+
+        st.divider()
+        st.markdown("### 📋 Copy for Paper")
+        st.text_area("Multi-Agent", value=final_review, height=120, key="copy_m")
+        st.text_area("Single Agent", value=single_out, height=120, key="copy_s")
+        st.text_area("Original Code", value=code_used, height=120, key="copy_c")
+
+    if st.session_state.get("last_review"):
+        st.divider()
+        st.markdown("### 🔧 Auto-Fix")
+        if st.button("⚙️ Generate Fixed Code"):
+            client = get_client()
+            if client:
+                with st.spinner("Fixing..."):
+                    fixed = fix_agent(client, st.session_state.get("last_code", ""), st.session_state["last_review"])
+                    if fixed:
+                        st.session_state["fixed_code"] = fixed
+        if st.session_state.get("fixed_code"):
+            orig = st.session_state.get("last_code", "")
+            fixed = st.session_state["fixed_code"]
+            f1, f2, f3 = st.tabs(["📄 Fixed", "🔀 Diff", "⬇️ Download"])
+            with f1: st.code(fixed, language="python")
+            with f2:
+                d = generate_diff(orig, fixed)
+                if d:
+                    st.markdown(f'<pre style="font-size:0.75rem">{d}</pre>', unsafe_allow_html=True)
+            with f3:
+                st.download_button("Download", data=fixed, file_name="fixed_code.py", mime="text/plain")
+
+# ── TAB 2: ABLATION ─────────────────────────────────────────
+
+with tab2:
+    st.markdown('<p class="hero-title">Ablation Study</p>', unsafe_allow_html=True)
+    st.markdown('<p class="hero-sub">7 configs × 6 samples — uses cached results</p>', unsafe_allow_html=True)
+
+    st.markdown("""
+    | Config | Agents | Calls |
+    |---|---|---|
+    | C1 | Single Agent | 1 |
+    | C2 | Tool Only | 0 (no LLM) |
+    | C3 | Tool + Security | 1 |
+    | C4 | Tool + Sec + Corr | 2 |
+    | C5 | Full (no Debate) | 3 |
+    | C6 | Full + Debate | 4 |
+    | C7 | Full + Debate + Verify | 5 |
+    """)
+
+    st.divider()
+    mode = st.radio("Mode", ["batch", "cached"], format_func=lambda x: {"batch": "📊 Run All 3 Samples", "cached": "📂 Load Cached"}[x], horizontal=True)
+
+    if mode == "batch":
+        samples = {}
+        for name, code in SAMPLE_CODES.items():
+            if st.checkbox(f"Include: {name}", value=True, key=f"inc_{name}"):
+                samples[name] = code
+    else:
+        samples = None
+
+    if st.button("🧪 Run Ablation", type="primary"):
+        client = get_client()
+        if not client:
+            st.error("API key not found.")
+        elif mode == "cached":
+            pass
+        elif not samples:
+            st.error("Select samples.")
+        else:
+            if st.session_state["token_count"]["errors"] > 8:
+                st.error("Too many errors. Wait 60s.")
+                st.stop()
+            st.session_state["token_count"] = {"total": 0, "calls": 0, "errors": 0}
+            st.session_state.pop("ablation_results", None)
+            ph = st.empty()
+            def pcb(msg): ph.info(f"🔄 {msg}")
+            with st.spinner("Running..."):
+                all_res = {}
+                for i, (name, code) in enumerate(samples.items()):
+                    pcb(f"Sample {i+1}/{len(samples)}: {name}")
+                    r = run_ablation(client, code, name, pcb)
+                    if r:
+                        all_res[name] = r
+                    if i < len(samples) - 1:
+                        time.sleep(15)
+            ph.success("Done!")
+            st.session_state["ablation_results"] = all_res
+
+    all_res = st.session_state.get("ablation_results")
+    if all_res is None and os.path.exists(ABLATION_CACHE):
+        try:
+            with open(ABLATION_CACHE) as f:
+                cached = json.load(f)
+            all_res = {}
+            for sn, sd in cached.items():
+                if "scores" in sd:
+                    all_res[sn] = {c: {"avg_score": s, "findings": sd.get("findings", {}).get(c, {})}
+                                   for c, s in sd["scores"].items()}
+        except:
+            pass
+
+    if all_res:
+        st.divider()
+        for sn, res in all_res.items():
+            st.markdown(f"#### {sn}")
+            cols = st.columns(min(len(res), 7))
+            colors = ["#e05252", "#f5a623", "#e8a435", "#8bc34a", "#4caf50", "#2196f3", "#9c27b0"]
+            for i, (col, (cfg, data)) in enumerate(zip(cols, res.items())):
+                with col:
+                    st.markdown(f"""<div class="stat-card" style="border-color:{colors[i%7]}44">
+                        <div class="stat-label">C{i+1}</div>
+                        <div class="stat-num" style="color:{colors[i%7]};font-size:1.3rem">{data.get('avg_score', '?')}</div>
+                        <div class="stat-label">/ 25</div></div>""", unsafe_allow_html=True)
+
+        if len(all_res) > 1:
+            st.divider()
+            st.markdown("### Aggregate")
+            agg = compute_aggregate(all_res)
+            cfgs = list(agg.keys())
+            st.markdown("#### Table: Mean ± Std")
+            header = "| Config | " + " | ".join(f"C{i+1}" for i in range(len(cfgs))) + " |"
+            sep = "|---|" + "|".join("---" for _ in cfgs) + " |"
+            row1 = "| Mean | " + " | ".join(f"{agg[c]['mean']}" for c in cfgs) + " |"
+            row2 = "| Std | " + " | ".join(f"±{agg[c]['std']}" for c in cfgs) + " |"
+            rows = []
+            for sn in all_res:
+                rows.append(f"| {sn} | " + " | ".join(f"{agg[c]['per_sample'].get(sn, '—')}" for c in cfgs) + " |")
+            st.markdown(header + "\n" + sep + "\n" + row1 + "\n" + row2 + "\n" + "\n".join(rows))
+
+            # Aggregate chart
+            ct = chart_theme()
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=[f"C{i+1}" for i in range(len(cfgs))],
+                y=[agg[c]["mean"] for c in cfgs], marker_color=colors[:len(cfgs)],
+                text=[f"{agg[c]['mean']}±{agg[c]['std']}" for c in cfgs], textposition="outside",
+                error_y=dict(type='data', array=[agg[c]["std"] for c in cfgs], visible=True)))
+            fig.update_layout(title="Aggregate Score",
+                yaxis=dict(range=[0, 28], gridcolor=ct["xaxis"]["gridcolor"],
+                           tickfont=dict(color=ct["yaxis"]["tickfont"]["color"])),
+                xaxis=dict(tickfont=dict(color=ct["xaxis"]["tickfont"]["color"])),
+                height=400,
+                template=ct["template"],
+                paper_bgcolor=ct["paper_bgcolor"],
+                plot_bgcolor=ct["plot_bgcolor"],
+                font=ct["font"],
+                legend=ct["legend"],
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Contribution chart
+            contrib = {}
+            for label, hi, lo in [("Tool", 1, 0), ("Security", 2, 1), ("Correctness", 3, 2),
+                                    ("Synthesizer", 4, 3), ("Debate", 5, 4), ("Verification", 6, 5)]:
+                if len(cfgs) > hi:
+                    contrib[label] = round(agg[cfgs[hi]]["mean"] - agg[cfgs[lo]]["mean"], 1)
+            if contrib:
+                fig2 = go.Figure()
+                fig2.add_trace(go.Bar(x=list(contrib.keys()), y=list(contrib.values()),
+                    marker_color=["#4caf50" if v > 0 else "#e05252" for v in contrib.values()],
+                    text=[f"+{v}" if v >= 0 else str(v) for v in contrib.values()], textposition="outside"))
+                fig2.update_layout(title="Agent Contribution", yaxis_title="Delta",
+                    yaxis=dict(gridcolor=ct["xaxis"]["gridcolor"],
+                               tickfont=dict(color=ct["yaxis"]["tickfont"]["color"])),
+                    xaxis=dict(tickfont=dict(color=ct["xaxis"]["tickfont"]["color"])),
+                    height=350,
+                    template=ct["template"],
+                    paper_bgcolor=ct["paper_bgcolor"],
+                    plot_bgcolor=ct["plot_bgcolor"],
+                    font=ct["font"],
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+                top = max(contrib, key=contrib.get)
+                st.success(f"🔑 **{top}** contributes most (+{contrib[top]} pts)")
+
+            st.divider()
+            export = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                       "aggregate": {k: {"mean": v["mean"], "std": v["std"], "per_sample": v["per_sample"]} for k, v in agg.items()},
+                       "contributions": contrib}
+            st.download_button("📥 Export JSON", data=json.dumps(export, indent=2),
+                file_name=f"ablation_{datetime.now().strftime('%Y%m%d_%H%M')}.json", mime="application/json")
+
+# ── TAB 3 ────────────────────────────────────────────────────
+
+with tab3:
+    st.markdown('<p class="hero-title">Methodology</p>', unsafe_allow_html=True)
+    st.markdown("""
+    ### Research Question
+    > Does multi-agent deliberation with tool use improve code review quality, and which configurations yield optimal tradeoffs?
+
+    ### Hypotheses
+    | # | Hypothesis | Test |
+    |---|---|---|
+    | H1 | Multi-agent > single-agent | Ablation + LLM-as-Judge |
+    | H2 | Specialist > generalist | Domain-specific vs general |
+    | H3 | Debate reduces hallucinations | Rate with/without debate |
+    | H4 | Verification reduces false positives | Count findings removed |
+    | H5 | Diminishing returns | Marginal contribution |
+
+    ### Evaluation: LLM-as-Judge (Zheng 2023)
+    5 dimensions × 5 points = 25 total:
+    Completeness, Accuracy, Actionability, Prioritization, Low Hallucination
+
+    ### Threats to Validity
+    | Threat | Mitigation |
+    |---|---|
+    | Judge bias | Independent 5-AI evaluation |
+    | Same model judge+agents | Could use different model |
+    | Small sample | Test on real repos |
+    | Verbosity bias | Structured output comparison |
+    """)
+
+# ── TAB 4 ────────────────────────────────────────────────────
+
+with tab4:
+    st.markdown("## How It Works")
+
+    st.markdown("""
+### Multi-Agent Pipeline + Fix Agent
+
+**Tool Agent** - AST + regex. Ground truth, no LLM.  
+**Security Reviewer** - OWASP, injection, secrets.  
+**Correctness Reviewer** - Logic bugs, edge cases.  
+**Debate Agent** - Compares Security vs Correctness.  
+**Synthesizer** - Merges, deduplicates, prioritizes.  
+**Verifier** - Checks findings against code.  
+**Fix Agent** - Rewrites code with all fixes.
+""")
+
+    st.markdown("### Flow")
+
+    st.markdown("""
+<div style="
+background:#f8fafc;
+padding:24px;
+border-radius:14px;
+border:1px solid #d1d5db;
+font-size:18px;
+line-height:2;
+font-weight:600;
+color:#111111;">
+
+Input Code<br>
+↓<br>
+Tool Agent<br>
+↓<br>
+├─ Security Reviewer<br>
+└─ Correctness Reviewer<br>
+↓<br>
+Synthesizer<br>
+↓<br>
+Verifier<br>
+↓<br>
+Fix Agent<br>
+↓<br>
+Reviewed / Corrected Code
+
+</div>
+""", unsafe_allow_html=True)
+
+    st.caption("Figure 1. Multi-agent code review workflow.")
