@@ -600,6 +600,8 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
     }
 
     for name, output in configs.items():
+        if name not in ["Single Agent", "Full (no Debate)"]:
+            continue
         if progress_cb: progress_cb(f"Judging: {name}...")
         raw = llm_as_judge(client, code, output)
         time.sleep(DELAY)
