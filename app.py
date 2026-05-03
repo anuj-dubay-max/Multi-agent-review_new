@@ -83,18 +83,37 @@ def call_agent_router(system_prompt, user_prompt):
             timeout=10
         )
 
+        # 🔥 DEBUG (you NEED this)
+        st.write("Router raw:", response.text[:300])
+
+        # ❌ Not 200 → exit early
         if response.status_code != 200:
-            st.warning("Agent Router failed")
+            st.warning(f"Router HTTP {response.status_code}")
             return None
 
-        data = response.json()
+        # ❌ Empty response
+        if not response.text or not response.text.strip():
+            st.warning("Router returned empty response")
+            return None
+
+        # ❌ Try JSON safely
+        try:
+            data = response.json()
+        except Exception as e:
+            st.warning(f"Router JSON error: {e}")
+            return None
+
+        # ❌ Structure check
+        if "choices" not in data:
+            st.warning("Router invalid format")
+            return None
 
         return data["choices"][0]["message"]["content"]
 
     except Exception as e:
         st.error(f"Router fallback failed: {e}")
         return None
-
+    
 MEMORY_FILE = "review_memory.json"
 ABLATION_CACHE = "ablation_cache.json"
 
