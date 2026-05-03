@@ -563,21 +563,21 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
         sec = ""
         
     if progress_cb: progress_cb("Correctness Reviewer...")
-    corr = correctness_reviewer(client, code, tf)
+    corr = ""
     time.sleep(DELAY)
     if corr is None:
         st.warning(f"Correctness reviewer failed for '{sample_name}', skipping sample.")
         return {}
 
     if progress_cb: progress_cb("Synthesizer (no debate)...")
-    no_debate = synthesizer(client, sec, corr, tf)
+    no_debate = ""
     time.sleep(DELAY)
     if no_debate is None:
         st.warning(f"Synthesizer failed for '{sample_name}', skipping.")
         return {}
 
     if progress_cb: progress_cb("Debate Agent...")
-    debate = debate_agent(client, sec, corr, code)
+    # debate = debate_agent(client, sec, corr, code)
     time.sleep(DELAY)
 
     if progress_cb: progress_cb("Synthesizer (with debate)...")
@@ -1412,7 +1412,7 @@ with tab2:
 
     if mode == "batch":
         samples = {}
-        for name, code in SAMPLE_CODES.items():
+        for name, code in samples.items():
             if st.checkbox(f"Include: {name}", value=True, key=f"inc_{name}"):
                 samples[name] = code
     else:
@@ -1437,6 +1437,7 @@ with tab2:
             with st.spinner("Running..."):
                 all_res = {}
                 for i, (name, code) in enumerate(samples.items()):
+                    st.write("RUNNING SAMPLE:", name)
                     pcb(f"Sample {i+1}/{len(samples)}: {name}")
                     r = run_ablation(client, code, name, pcb)
                     if r:
