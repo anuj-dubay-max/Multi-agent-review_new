@@ -563,14 +563,14 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
         sec = ""
         
     if progress_cb: progress_cb("Correctness Reviewer...")
-    corr = ""
+    corr = correctness_reviewer(client, code, tf)
     time.sleep(DELAY)
     if corr is None:
         st.warning(f"Correctness reviewer failed for '{sample_name}', skipping sample.")
         return {}
 
     if progress_cb: progress_cb("Synthesizer (no debate)...")
-    no_debate = ""
+    no_debate = synthesizer(client, sec, corr, tf)
     time.sleep(DELAY)
     if no_debate is None:
         st.warning(f"Synthesizer failed for '{sample_name}', skipping.")
@@ -1412,7 +1412,7 @@ with tab2:
 
     if mode == "batch":
         samples = {}
-        for name, code in samples.items():
+        for name, code in SAMPLE_CODES.items():
             if st.checkbox(f"Include: {name}", value=True, key=f"inc_{name}"):
                 samples[name] = code
     else:
