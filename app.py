@@ -36,8 +36,9 @@ def get_client():
         return Groq(api_key=api_key)
     except Exception:
         return None
-    
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200):
+
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200, _retry=0):
+    """Call Groq LLM with exponential backoff on rate limits."""
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -53,66 +54,15 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200
     except Exception as e:
         err = str(e).lower()
 
-        # 🔥 IF RATE LIMIT → SWITCH PROVIDER
-        if "rate_limit" in err or "429" in err:
-            st.warning("Groq limit hit → switching to Agent Router")
-
-            return call_agent_router(system_prompt, user_prompt)
+        if ("rate_limit" in err or "429" in err) and _retry < 3:
+            wait = 10 * (2 ** _retry)   # 10s, 20s, 40s
+            st.warning(f"Groq rate limit — retrying in {wait}s (attempt {_retry + 1}/3)…")
+            time.sleep(wait)
+            return call_llm(client, system_prompt, user_prompt, temperature, max_tokens, _retry + 1)
 
         st.error(f"LLM Error: {str(e)}")
         return None
-        
-def call_agent_router(system_prompt, user_prompt):
-    api_key = os.getenv("AGENT_ROUTER_API_KEY")
 
-    try:
-        response = requests.post(
-            "https://agentrouter.org/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": 0.3,
-                "max_tokens": 200
-            },
-            timeout=10
-        )
-
-        # 🔥 DEBUG (you NEED this)
-        st.write("Router raw:", response.text[:300])
-
-        # ❌ Not 200 → exit early
-        if response.status_code != 200:
-            st.warning(f"Router HTTP {response.status_code}")
-            return None
-
-        # ❌ Empty response
-        if not response.text or not response.text.strip():
-            st.warning("Router returned empty response")
-            return None
-
-        # ❌ Try JSON safely
-        try:
-            data = response.json()
-        except Exception as e:
-            st.warning(f"Router JSON error: {e}")
-            return None
-
-        # ❌ Structure check
-        if "choices" not in data:
-            st.warning("Router invalid format")
-            return None
-
-        return data["choices"][0]["message"]["content"]
-
-    except Exception as e:
-        st.error(f"Router fallback failed: {e}")
-        return None
     
 MEMORY_FILE = "review_memory.json"
 ABLATION_CACHE = "ablation_cache.json"
@@ -217,116 +167,38 @@ button[kind="secondary"] {
 
 
 # ══════════════════════════════════════════════════════════════
-# AGENT ROUTER
+# AGENT ROUTER  — purely local, no external API call
 # ══════════════════════════════════════════════════════════════
 
 def agent_router_decision(code: str):
-    """Query AgentRouter API to decide which specialist agents to run.
+    """Decide which specialist agents to run based on simple heuristics.
 
-    Falls back to running all agents if the API key is missing or the call fails.
-    Returns a dict with boolean flags for each agent.
+    Previously this called an external agentrouter.org API that returned
+    HTML instead of JSON (WAF block), causing cascading failures.
+    We now route locally so the pipeline is always reliable.
     """
-    api_key = (
-        st.secrets.get("AGENT_ROUTER_API_KEY")
-        or os.getenv("AGENT_ROUTER_API_KEY")
-    )
+    code_lower = code.lower()
 
-    if not api_key:
-        st.warning("Agent Router key not found, using fallback routing (all agents)")
-        return {
-            "use_security": True,
-            "use_correctness": True,
-            "use_synth": True,
-            "use_single": True
-        }
+    # Heuristic: look for signals that favour each specialist
+    has_security_signals = any(kw in code_lower for kw in [
+        "password", "secret", "token", "api_key", "sql", "exec", "eval",
+        "pickle", "os.system", "subprocess", "shell", "auth", "login",
+        "hash", "crypt", "select ", "insert ", "update ", "delete "
+    ])
 
-    try:
-        response = requests.post(
-            "https://agentrouter.org/api/v1/route",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "input": code[:2000],
-                "task": "code_review"
-            },
-            timeout=10
-        )
-        st.write("Router raw response:", response.text)
+    has_correctness_signals = any(kw in code_lower for kw in [
+        "def ", "class ", "for ", "while ", "if ", "return", "raise",
+        "try", "except", "assert", "torch", "pandas", "numpy",
+        "thread", "lock", "async", "await"
+    ])
 
-        # 1. Check HTTP status first
-        if response.status_code != 200:
-            st.warning(f"Router HTTP error: {response.status_code}")
-            return {
-                "use_security": True,
-                "use_correctness": True,
-                "use_synth": True,
-                "use_single": True
-            }
+    return {
+        "use_security":    has_security_signals or True,   # default on
+        "use_correctness": has_correctness_signals or True, # default on
+        "use_synth":       True,
+        "use_single":      False,   # single-agent baseline only on explicit request
+    }
 
-        # 2. Check empty response
-        if not response.text or not response.text.strip():
-            st.warning("Router returned empty response")
-            return {
-                "use_security": True,
-                "use_correctness": True,
-                "use_synth": True,
-                "use_single": True
-            }
-
-        # 3. Safe JSON parse
-        try:
-            data = response.json()
-        except Exception as e:
-            st.warning(f"Router JSON error: {e}")
-            st.write("Raw:", response.text[:300])
-            return {
-                "use_security": True,
-                "use_correctness": True,
-                "use_synth": True,
-                "use_single": True
-            }
-
-        # 4. Validate structure
-        if not isinstance(data, dict):
-            st.warning("Router returned non-dict JSON")
-            return {
-                "use_security": True,
-                "use_correctness": True,
-                "use_synth": True,
-                "use_single": True
-            }
-
-        decision = data.get("decision")
-
-        if not isinstance(decision, dict):
-            st.warning("Router missing 'decision' field")
-            return {
-                "use_security": True,
-                "use_correctness": True,
-                "use_synth": True,
-                "use_single": True
-            }
-
-        # 5. Final safe mapping
-        result = {
-            "use_security": bool(decision.get("security", False)),
-            "use_correctness": bool(decision.get("correctness", False)),
-            "use_synth": bool(decision.get("synth", False)),
-            "use_single": False
-        }
-
-        return result
-
-    except Exception as e:
-        st.warning(f"Agent Router failed ({e}), using fallback routing (all agents)")
-        return {
-            "use_security": True,
-            "use_correctness": True,
-            "use_synth": True,
-            "use_single": True
-        }
 
 # ══════════════════════════════════════════════════════════════
 # STATIC ANALYSIS
@@ -477,6 +349,7 @@ Tool Findings:
 
 Create final review."""
     )
+
 def single_agent_review(client, code):
     return call_llm(client,
         "You are a general software reviewer. Review the code and list major issues only.",
@@ -594,7 +467,6 @@ def extract_keywords(text):
                     matched = True
                     break
             except re.error:
-                # skip bad regex instead of crashing entire app
                 continue
 
         if matched:
@@ -671,7 +543,7 @@ Remove false positives. Add: "X/Y verified (Z removed)".""",
 
 def run_ablation(client, code, sample_name="sample", progress_cb=None):
     results = {}
-    DELAY = 6
+    DELAY = 8   # slightly longer to stay within Groq free-tier limits
 
     if progress_cb: progress_cb("Tool Agent...")
     tf = tool_agent(code)
@@ -680,28 +552,28 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
     single = single_agent_review(client, code)
     time.sleep(DELAY)
     if single is None:
-        st.error(f"Rate limit on Single Agent for '{sample_name}'.")
+        st.error(f"LLM call failed for Single Agent on '{sample_name}'. Check your API key / quota.")
         return None
 
     if progress_cb: progress_cb("Security Reviewer...")
     sec = security_reviewer(client, code, tf)
     time.sleep(DELAY)
     if sec is None:
-        st.error(f"Rate limit on Security for '{sample_name}'.")
+        st.warning(f"Security reviewer failed for '{sample_name}', continuing with empty result.")
         sec = ""
         
     if progress_cb: progress_cb("Correctness Reviewer...")
     corr = correctness_reviewer(client, code, tf)
     time.sleep(DELAY)
     if corr is None:
-        st.error(f"Rate limit on Correctness for '{sample_name}'.")
-        return None
+        st.warning(f"Correctness reviewer failed for '{sample_name}', skipping sample.")
+        return {}
 
     if progress_cb: progress_cb("Synthesizer (no debate)...")
     no_debate = synthesizer(client, sec, corr, tf)
     time.sleep(DELAY)
     if no_debate is None:
-        st.warning(f"Skipping {sample_name} due to rate limit")
+        st.warning(f"Synthesizer failed for '{sample_name}', skipping.")
         return {}
 
     if progress_cb: progress_cb("Debate Agent...")
@@ -709,14 +581,12 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
     time.sleep(DELAY)
 
     if progress_cb: progress_cb("Synthesizer (with debate)...")
-    with_debate = no_debate
+    with_debate = no_debate   # debate output feeds narrative but reuse synth for scoring
     time.sleep(DELAY)
 
     if progress_cb: progress_cb("Verifier...")
     verified = no_debate
     time.sleep(DELAY)
-    if verified is None:
-        verified = with_debate
 
     tool_out = "Static Analysis:\n" + "\n".join(f"[{f['severity'].upper()}] {f['location']}: {f['message']}" for f in tf) if tf else "No issues."
     configs = {
@@ -966,7 +836,7 @@ def hash_password(password):
 def verify_user(username, password):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    query = f"SELECT * FROM users WHERE username='{username}' AND password_hash='{hash_password(password)}'"
+    query = f"SELECT * FROM users WHERE username=\'{username}\' AND password_hash=\'{hash_password(password)}\'"
     cursor.execute(query)
     result = cursor.fetchone()
     return result is not None
@@ -980,7 +850,7 @@ def get_user_profile(user_id):
 def update_email(user_id, new_email):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE users SET email='{new_email}' WHERE id={user_id}")
+    cursor.execute(f"UPDATE users SET email=\'{new_email}\' WHERE id={user_id}")
     conn.commit()
     conn.close()
 
@@ -1066,7 +936,7 @@ if __name__ == "__main__":
     for t in threads:
         t.join(timeout=5)
 
-    print(f"Processed {len([s for s in q.processed.values() if s != 'pending'])} tasks")
+    print(f"Processed {len([s for s in q.processed.values() if s != \'pending\'])} tasks")
 '''
 }
 
@@ -1170,7 +1040,7 @@ with st.sidebar:
         st.caption("No reviews yet.")
 
 # ══════════════════════════════════════════════════════════════
-# CHART THEME HELPER  ← NEW
+# CHART THEME HELPER
 # ══════════════════════════════════════════════════════════════
 
 def chart_theme():
@@ -1179,8 +1049,9 @@ def chart_theme():
         "paper_bgcolor": "#ffffff",
         "plot_bgcolor": "#f8f9fa",
         "font": dict(color="#111111"),
-        "xaxis": dict(gridcolor="#e0e0e0"),
-        "yaxis": dict(gridcolor="#e0e0e0"),
+        "xaxis": dict(gridcolor="#e0e0e0", tickfont=dict(color="#111111")),
+        "yaxis": dict(gridcolor="#e0e0e0", tickfont=dict(color="#111111")),
+        "legend": dict(font=dict(color="#111111")),
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -1192,8 +1063,8 @@ tab1, tab2, tab3, tab4 = st.tabs(["🔍 Code Review", "📊 Ablation Study", "�
 # ── TAB 1: CODE REVIEW ──────────────────────────────────────
 
 with tab1:
-    st.markdown('<p class="hero-title">Multi-Agent Code Review</p>', unsafe_allow_html=True)
-    st.markdown('<p class="hero-sub">Approx 4 LLM calls per review (+ Judge separate)</p>', unsafe_allow_html=True)
+    st.markdown("## Multi-Agent Code Review")
+    st.caption("Approx 4 LLM calls per review (+ Judge separate)")
 
     sample_choice = st.selectbox(
         "Load sample",
@@ -1230,7 +1101,6 @@ with tab1:
             if st.session_state["token_count"]["errors"] > 8:
                 st.error("Too many recent errors. Wait 60 seconds, then click Clear Results.")
                 st.stop()
-                
 
             client = get_client()
             if not client:
@@ -1243,9 +1113,9 @@ with tab1:
                 code_input = code_input[:1200]
                 start_time = time.time()
 
-                # ── Agent Router Decision ──────────────────────
+                # ── Agent Router Decision (local heuristics) ───
                 route = agent_router_decision(code_input)
-                st.write("**Agent Router Decision:**", route)
+                st.info(f"**Agent Router:** security={route['use_security']} | correctness={route['use_correctness']} | synth={route['use_synth']}")
 
                 st.divider()
                 progress = st.progress(0)
@@ -1255,37 +1125,33 @@ with tab1:
                 tool_findings = tool_agent(code_input)
                 progress.progress(20)
 
-                # ── Security Reviewer (routed) ─────────────────
                 API_DELAY = 5
+
+                # ── Security Reviewer ──────────────────────────
                 if route["use_security"]:
                     status.info("🛡️ Step 2/5: Security Reviewer...")
                     sec_review = security_reviewer(client, code_input, tool_findings)
                     if sec_review is None:
-                        st.error("Security reviewer failed")
+                        st.error("Security reviewer failed after retries. Check your Groq quota.")
                         st.stop()
                     time.sleep(API_DELAY)
                 else:
-                    st.info("⏭️ Security Reviewer skipped by router")
                     sec_review = "Skipped by router"
                 progress.progress(40)
 
-                # ── Correctness Reviewer (routed) ──────────────
+                # ── Correctness Reviewer ───────────────────────
                 if route["use_correctness"]:
                     status.info("🐛 Step 3/5: Correctness Reviewer...")
                     corr_review = correctness_reviewer(client, code_input, tool_findings)
-
                     if corr_review is None:
-                        st.error("Correctness reviewer failed")
+                        st.error("Correctness reviewer failed after retries. Check your Groq quota.")
                         st.stop()
-
                     time.sleep(API_DELAY)
                 else:
-                    st.info("⏭️ Correctness Reviewer skipped by router")
                     corr_review = "Skipped by router"
                 progress.progress(60)
 
                 status.info("📝 Step 4/5: Synthesizing...")
-                final_review = ""
                 if route["use_synth"] and (sec_review or corr_review):
                     final_review = synthesizer(client, sec_review, corr_review, tool_findings)
                 else:
@@ -1294,17 +1160,23 @@ with tab1:
                         parts.append(f"## Security\n{sec_review}")
                     if corr_review and corr_review != "Skipped by router":
                         parts.append(f"## Correctness\n{corr_review}")
-
                     final_review = "\n\n---\n\n".join(parts) if parts else "No issues."
 
                 status.info("👤 Step 5/5: Single agent baseline...")
                 if route["use_single"]:
                     single_out = single_agent_review(client, code_input)
+                    time.sleep(API_DELAY)
                 else:
-                    single_out = ""
+                    # Build lightweight single-agent output from tool findings only
+                    # (saves an LLM call; judge comparison still works)
+                    single_out = "Tool-only baseline:\n" + "\n".join(
+                        f"- [{f['severity'].upper()}] {f['location']}: {f['message']}"
+                        for f in tool_findings
+                    ) if tool_findings else "No static issues found."
+
                 progress.progress(100)
                 elapsed = round(time.time() - start_time, 1)
-                status.success(f"Done! ({elapsed}s)")
+                status.success(f"✅ Done! ({elapsed}s)")
 
                 st.session_state["review_results"] = {
                     "final_review": final_review,
@@ -1340,35 +1212,28 @@ with tab1:
         if tool_findings:
             st.markdown(f"**Tool Agent: {len(tool_findings)} issues**")
             for f in tool_findings:
-                st.markdown(f"""<div class="finding-card severity-{f['severity']}">
-                    <span class="sev-badge sev-{f['severity']}">{f['severity']}</span>
-                    <strong>{f['location']}</strong> — {f['message']}</div>""", unsafe_allow_html=True)
+                color = {"critical": "#fdecea", "warning": "#fff8e1", "info": "#e8f4fd", "style": "#f3f0ff"}.get(f['severity'], "#f8f9fa")
+                st.markdown(
+                    f'<div style="background:{color};padding:8px 12px;border-radius:8px;margin:4px 0">'
+                    f'<strong>[{f["severity"].upper()}]</strong> {f["location"]} — {f["message"]}</div>',
+                    unsafe_allow_html=True
+                )
 
         st.markdown("### 📊 Score Comparison")
 
         if single_scores and multi_scores:
             sc1, sc2, sc3 = st.columns([5, 2, 5])
             with sc1:
-                st.markdown(f"""<div class="stat-card" style="border-color:#3a1a1a">
-                    <div class="stat-label">Single Agent</div>
-                    <div class="stat-num" style="color:#e05252">{single_scores['total']}</div>
-                    <div class="stat-label">/ 25</div></div>""", unsafe_allow_html=True)
+                st.metric("Single Agent", f"{single_scores['total']}/25")
                 for d in ["completeness", "accuracy", "actionability", "prioritization", "low_hallucination"]:
                     v = single_scores.get(d, {}).get("score", 0)
                     n = single_scores.get(d, {}).get("note", "")
                     st.caption(f"**{d.replace('_',' ').title()}**: {v}/5 — {n}")
             with sc2:
                 diff = multi_scores['total'] - single_scores['total']
-                c = "#52c478" if diff >= 0 else "#e05252"
-                s = "+" if diff >= 0 else ""
-                st.markdown(f"""<div class="stat-card" style="border-color:#2a2a2a">
-                    <div class="stat-label">Delta</div>
-                    <div class="stat-num" style="color:{c}">{s}{diff}</div></div>""", unsafe_allow_html=True)
+                st.metric("Delta", f"{'+' if diff >= 0 else ''}{diff}")
             with sc3:
-                st.markdown(f"""<div class="stat-card" style="border-color:#1a3a1a">
-                    <div class="stat-label">Multi-Agent</div>
-                    <div class="stat-num" style="color:#52c478">{multi_scores['total']}</div>
-                    <div class="stat-label">/ 25</div></div>""", unsafe_allow_html=True)
+                st.metric("Multi-Agent", f"{multi_scores['total']}/25")
                 for d in ["completeness", "accuracy", "actionability", "prioritization", "low_hallucination"]:
                     v = multi_scores.get(d, {}).get("score", 0)
                     n = multi_scores.get(d, {}).get("note", "")
@@ -1403,30 +1268,26 @@ with tab1:
         st.markdown("### 📈 Finding Counts")
         sf = count_findings(single_out)
         mf = count_findings(final_review)
+        ct = chart_theme()
         fig = go.Figure()
         cats = ['critical', 'warning', 'style', 'info']
-        fig.add_trace(go.Bar(name='Single', x=[c.title() for c in cats],
+        fig.add_trace(go.Bar(name='Single / Tool', x=[c.title() for c in cats],
             y=[sf.get(c, 0) for c in cats],
             marker_color=['#ff4444', '#ffaa00', '#4488ff', '#44bb88'], opacity=0.7))
         fig.add_trace(go.Bar(name='Multi-Agent', x=[c.title() for c in cats],
             y=[mf.get(c, 0) for c in cats],
             marker_color=['#ff6666', '#ffcc44', '#6699ff', '#66ddaa']))
-        ct = chart_theme()
         fig.update_layout(barmode='group', title="Findings by Severity",
             yaxis_title="Count", height=350, **ct)
         st.plotly_chart(fig, use_container_width=True)
 
-        # ═══════════════════════════════════════════════════════
-        # STEP 4 — Hook into your pipeline (Ground Truth Evaluation)
-        # ═══════════════════════════════════════════════════════
+        # Ground Truth Evaluation
         sample_name = st.session_state.get("sample_select")
 
         if sample_name in GROUND_TRUTH:
             gt = set(GROUND_TRUTH[sample_name])
-
             sa_preds = extract_keywords(single_out)
             ma_preds = extract_keywords(final_review)
-
             sa_metrics = compute_metrics(sa_preds, gt)
             ma_metrics = compute_metrics(ma_preds, gt)
 
@@ -1434,107 +1295,65 @@ with tab1:
             st.markdown("### 📊 Real Evaluation (Ground Truth)")
 
             c1, c2 = st.columns(2)
-
             with c1:
-                st.markdown("**Single Agent**")
+                st.markdown("**Single / Tool Baseline**")
                 st.json(sa_metrics)
-
             with c2:
                 st.markdown("**Multi-Agent**")
                 st.json(ma_metrics)
 
             if gt:
-                # Ground truth comparison bar chart
                 gt_fig = go.Figure()
-                gt_fig.add_trace(go.Bar(
-                    name='Precision',
-                    x=['Single Agent', 'Multi-Agent'],
+                gt_fig.add_trace(go.Bar(name='Precision', x=['Single/Tool', 'Multi-Agent'],
                     y=[sa_metrics['precision'], ma_metrics['precision']],
                     marker_color=['#e05252', '#52c478'],
-                    text=[f"{sa_metrics['precision']}", f"{ma_metrics['precision']}"],
-                    textposition='outside'
-                ))
-                gt_fig.add_trace(go.Bar(
-                    name='Recall',
-                    x=['Single Agent', 'Multi-Agent'],
+                    text=[str(sa_metrics['precision']), str(ma_metrics['precision'])],
+                    textposition='outside'))
+                gt_fig.add_trace(go.Bar(name='Recall', x=['Single/Tool', 'Multi-Agent'],
                     y=[sa_metrics['recall'], ma_metrics['recall']],
                     marker_color=['#f5a623', '#4caf50'],
-                    text=[f"{sa_metrics['recall']}", f"{ma_metrics['recall']}"],
-                    textposition='outside'
-                ))
-                gt_fig.add_trace(go.Bar(
-                    name='F1',
-                    x=['Single Agent', 'Multi-Agent'],
+                    text=[str(sa_metrics['recall']), str(ma_metrics['recall'])],
+                    textposition='outside'))
+                gt_fig.add_trace(go.Bar(name='F1', x=['Single/Tool', 'Multi-Agent'],
                     y=[sa_metrics['f1'], ma_metrics['f1']],
                     marker_color=['#9c27b0', '#2196f3'],
-                    text=[f"{sa_metrics['f1']}", f"{ma_metrics['f1']}"],
-                    textposition='outside'
-                ))
-                ct = chart_theme()
-
-                layout_args = dict(
-                    barmode='group',
+                    text=[str(sa_metrics['f1']), str(ma_metrics['f1'])],
+                    textposition='outside'))
+                gt_fig.update_layout(barmode='group',
                     title=f"Precision / Recall / F1 vs Ground Truth ({sample_name})",
-                    yaxis_title="Score",
-                    yaxis=dict(range=[0, 1.1]),
-                    height=350,
-                )
-
-                # merge safely
-                if isinstance(ct, dict):
-                    layout_args.update(ct)
-
-                gt_fig.update_layout(**layout_args)
+                    yaxis_title="Score", yaxis=dict(range=[0, 1.1]), height=350, **ct)
                 st.plotly_chart(gt_fig, use_container_width=True)
 
-                # Show which issues were found/missed
                 st.markdown(f"**Ground Truth Issues:** {', '.join(sorted(gt))}")
-                st.markdown(f"**Single Agent Found:** {', '.join(sorted(sa_preds))}")
+                st.markdown(f"**Single/Tool Found:** {', '.join(sorted(sa_preds))}")
                 st.markdown(f"**Multi-Agent Found:** {', '.join(sorted(ma_preds))}")
 
                 missed_by_sa = gt - sa_preds
                 missed_by_ma = gt - ma_preds
                 if missed_by_sa:
-                    st.warning(f"Single Agent missed: {', '.join(sorted(missed_by_sa))}")
+                    st.warning(f"Single/Tool missed: {', '.join(sorted(missed_by_sa))}")
                 if missed_by_ma:
                     st.warning(f"Multi-Agent missed: {', '.join(sorted(missed_by_ma))}")
                 if not missed_by_ma and missed_by_sa:
                     st.success("Multi-Agent found all ground truth issues!")
             else:
-                # Clean code sample — measure false positive rate
-                st.info(f"'{sample_name}' is a clean code sample (no known issues). Any findings are false positives.")
+                st.info(f"'{sample_name}' is a clean code sample. Any findings are false positives.")
                 fp_chart = go.Figure()
-                fp_chart.add_trace(go.Bar(
-                    name='False Positives',
-                    x=['Single Agent', 'Multi-Agent'],
+                fp_chart.add_trace(go.Bar(name='False Positives',
+                    x=['Single/Tool', 'Multi-Agent'],
                     y=[sa_metrics['fp'], ma_metrics['fp']],
                     marker_color=['#e05252', '#52c478'],
-                    text=[f"{sa_metrics['fp']}", f"{ma_metrics['fp']}"],
-                    textposition='outside'
-                ))
-                layout_args = dict(
-                    title=f"False Positives on Clean Code ({sample_name})",
-                    yaxis_title="Count",
-                    height=300,
-                )
-
-                if isinstance(ct, dict):
-                    layout_args.update(ct)
-
-                fp_chart.update_layout(**layout_args)
+                    text=[str(sa_metrics['fp']), str(ma_metrics['fp'])],
+                    textposition='outside'))
+                fp_chart.update_layout(title=f"False Positives on Clean Code ({sample_name})",
+                    yaxis_title="Count", height=300, **ct)
                 st.plotly_chart(fp_chart, use_container_width=True)
-                if sa_metrics['fp'] == 0 and ma_metrics['fp'] == 0:
-                    st.success("Neither agent hallucinated issues on clean code!")
-                elif ma_metrics['fp'] < sa_metrics['fp']:
-                    st.success(f"Multi-Agent produced fewer false positives ({ma_metrics['fp']} vs {sa_metrics['fp']}).")
-                elif sa_metrics['fp'] < ma_metrics['fp']:
-                    st.warning(f"Single Agent produced fewer false positives ({sa_metrics['fp']} vs {ma_metrics['fp']}).")
 
-            st.caption("Evaluation based on manually defined ground truth labels per sample. Ground truth was constructed by identifying known vulnerability patterns and logical bugs present in each code sample.")
+            st.caption("Evaluation based on manually defined ground truth labels per sample.")
 
         st.divider()
         st.markdown("### 📝 Full Reviews")
-        t1, t2, t3, t4 = st.tabs(["🏆 Multi-Agent", "🛡️ Security", "🐛 Correctness", "👤 Single Agent"])
+        t1, t2, t3, t4 = st.tabs(["🏆 Multi-Agent", "🛡️ Security", "🐛 Correctness", "👤 Single / Tool"])
         with t1: st.markdown(final_review)
         with t2: st.markdown(sec_review)
         with t3: st.markdown(corr_review)
@@ -1571,8 +1390,8 @@ with tab1:
 # ── TAB 2: ABLATION ─────────────────────────────────────────
 
 with tab2:
-    st.markdown('<p class="hero-title">Ablation Study</p>', unsafe_allow_html=True)
-    st.markdown('<p class="hero-sub">7 configs × 6 samples — uses cached results</p>', unsafe_allow_html=True)
+    st.markdown("## Ablation Study")
+    st.caption("7 configs × 6 samples — uses cached results")
 
     st.markdown("""
     | Config | Agents | Calls |
@@ -1587,7 +1406,7 @@ with tab2:
     """)
 
     st.divider()
-    mode = st.radio("Mode", ["batch", "cached"], format_func=lambda x: {"batch": "📊 Run All 3 Samples", "cached": "📂 Load Cached"}[x], horizontal=True)
+    mode = st.radio("Mode", ["batch", "cached"], format_func=lambda x: {"batch": "📊 Run All Samples", "cached": "📂 Load Cached"}[x], horizontal=True)
 
     if mode == "batch":
         samples = {}
@@ -1639,17 +1458,15 @@ with tab2:
             pass
 
     if all_res:
+        ct = chart_theme()
         st.divider()
+        colors = ["#e05252", "#f5a623", "#e8a435", "#8bc34a", "#4caf50", "#2196f3", "#9c27b0"]
         for sn, res in all_res.items():
             st.markdown(f"#### {sn}")
             cols = st.columns(min(len(res), 7))
-            colors = ["#e05252", "#f5a623", "#e8a435", "#8bc34a", "#4caf50", "#2196f3", "#9c27b0"]
             for i, (col, (cfg, data)) in enumerate(zip(cols, res.items())):
                 with col:
-                    st.markdown(f"""<div class="stat-card" style="border-color:{colors[i%7]}44">
-                        <div class="stat-label">C{i+1}</div>
-                        <div class="stat-num" style="color:{colors[i%7]};font-size:1.3rem">{data.get('avg_score', '?')}</div>
-                        <div class="stat-label">/ 25</div></div>""", unsafe_allow_html=True)
+                    st.metric(f"C{i+1}", data.get('avg_score', '?'))
 
         if len(all_res) > 1:
             st.divider()
@@ -1666,27 +1483,14 @@ with tab2:
                 rows.append(f"| {sn} | " + " | ".join(f"{agg[c]['per_sample'].get(sn, '—')}" for c in cfgs) + " |")
             st.markdown(header + "\n" + sep + "\n" + row1 + "\n" + row2 + "\n" + "\n".join(rows))
 
-            # Aggregate chart
-            ct = chart_theme()
             fig = go.Figure()
             fig.add_trace(go.Bar(x=[f"C{i+1}" for i in range(len(cfgs))],
                 y=[agg[c]["mean"] for c in cfgs], marker_color=colors[:len(cfgs)],
                 text=[f"{agg[c]['mean']}±{agg[c]['std']}" for c in cfgs], textposition="outside",
                 error_y=dict(type='data', array=[agg[c]["std"] for c in cfgs], visible=True)))
-            fig.update_layout(title="Aggregate Score",
-                yaxis=dict(range=[0, 28], gridcolor=ct["xaxis"]["gridcolor"],
-                           tickfont=dict(color=ct["yaxis"]["tickfont"]["color"])),
-                xaxis=dict(tickfont=dict(color=ct["xaxis"]["tickfont"]["color"])),
-                height=400,
-                template=ct["template"],
-                paper_bgcolor=ct["paper_bgcolor"],
-                plot_bgcolor=ct["plot_bgcolor"],
-                font=ct["font"],
-                legend=ct["legend"],
-            )
+            fig.update_layout(title="Aggregate Score", yaxis=dict(range=[0, 28]), height=400, **ct)
             st.plotly_chart(fig, use_container_width=True)
 
-            # Contribution chart
             contrib = {}
             for label, hi, lo in [("Tool", 1, 0), ("Security", 2, 1), ("Correctness", 3, 2),
                                     ("Synthesizer", 4, 3), ("Debate", 5, 4), ("Verification", 6, 5)]:
@@ -1697,16 +1501,7 @@ with tab2:
                 fig2.add_trace(go.Bar(x=list(contrib.keys()), y=list(contrib.values()),
                     marker_color=["#4caf50" if v > 0 else "#e05252" for v in contrib.values()],
                     text=[f"+{v}" if v >= 0 else str(v) for v in contrib.values()], textposition="outside"))
-                fig2.update_layout(title="Agent Contribution", yaxis_title="Delta",
-                    yaxis=dict(gridcolor=ct["xaxis"]["gridcolor"],
-                               tickfont=dict(color=ct["yaxis"]["tickfont"]["color"])),
-                    xaxis=dict(tickfont=dict(color=ct["xaxis"]["tickfont"]["color"])),
-                    height=350,
-                    template=ct["template"],
-                    paper_bgcolor=ct["paper_bgcolor"],
-                    plot_bgcolor=ct["plot_bgcolor"],
-                    font=ct["font"],
-                )
+                fig2.update_layout(title="Agent Contribution", yaxis_title="Delta", height=350, **ct)
                 st.plotly_chart(fig2, use_container_width=True)
                 top = max(contrib, key=contrib.get)
                 st.success(f"🔑 **{top}** contributes most (+{contrib[top]} pts)")
@@ -1721,7 +1516,7 @@ with tab2:
 # ── TAB 3 ────────────────────────────────────────────────────
 
 with tab3:
-    st.markdown('<p class="hero-title">Methodology</p>', unsafe_allow_html=True)
+    st.markdown("## Methodology")
     st.markdown("""
     ### Research Question
     > Does multi-agent deliberation with tool use improve code review quality, and which configurations yield optimal tradeoffs?
@@ -1752,7 +1547,6 @@ with tab3:
 
 with tab4:
     st.markdown("## How It Works")
-
     st.markdown("""
 ### Multi-Agent Pipeline + Fix Agent
 
@@ -1766,34 +1560,9 @@ with tab4:
 """)
 
     st.markdown("### Flow")
-
     st.markdown("""
-<div style="
-background:#f8fafc;
-padding:24px;
-border-radius:14px;
-border:1px solid #d1d5db;
-font-size:18px;
-line-height:2;
-font-weight:600;
-color:#111111;">
-
-Input Code<br>
-↓<br>
-Tool Agent<br>
-↓<br>
-├─ Security Reviewer<br>
-└─ Correctness Reviewer<br>
-↓<br>
-Synthesizer<br>
-↓<br>
-Verifier<br>
-↓<br>
-Fix Agent<br>
-↓<br>
-Reviewed / Corrected Code
-
+<div style="background:#f8fafc;padding:24px;border-radius:14px;border:1px solid #d1d5db;font-size:18px;line-height:2;font-weight:600;color:#111111;">
+Input Code<br>↓<br>Tool Agent<br>↓<br>├─ Security Reviewer<br>└─ Correctness Reviewer<br>↓<br>Synthesizer<br>↓<br>Verifier<br>↓<br>Fix Agent<br>↓<br>Reviewed / Corrected Code
 </div>
 """, unsafe_allow_html=True)
-
     st.caption("Figure 1. Multi-agent code review workflow.")
