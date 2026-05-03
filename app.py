@@ -37,28 +37,76 @@ def get_client():
     except Exception:
         return None
 
+def _call_anthropic_fallback(system_prompt, user_prompt, max_tokens=200):
+    """Fallback to Anthropic Claude (claude-haiku-4-5-20251001) when Groq quota is exhausted."""
+    api_key = (
+        os.getenv("ANTHROPIC_API_KEY")
+        or st.secrets.get("ANTHROPIC_API_KEY", None)
+        or st.session_state.get("anthropic_api_key", None)
+    )
+    if not api_key:
+        return None
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": max_tokens,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            },
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data["content"][0]["text"]
+        else:
+            st.error(f"Anthropic fallback error {resp.status_code}: {resp.text[:200]}")
+            return None
+    except Exception as e:
+        st.error(f"Anthropic fallback exception: {e}")
+        return None
+
+
 def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200, _retry=0):
-    """Call Groq LLM with exponential backoff on rate limits."""
+    """Call Groq LLM with exponential backoff, then fall back to Anthropic Claude."""
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ],
             temperature=temperature,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
         )
         return resp.choices[0].message.content
 
     except Exception as e:
         err = str(e).lower()
 
+        # Retry up to 3× with exponential backoff for transient rate limits
         if ("rate_limit" in err or "429" in err) and _retry < 3:
-            wait = 10 * (2 ** _retry)   # 10s, 20s, 40s
+            wait = 10 * (2 ** _retry)  # 10s → 20s → 40s
             st.warning(f"Groq rate limit — retrying in {wait}s (attempt {_retry + 1}/3)…")
             time.sleep(wait)
             return call_llm(client, system_prompt, user_prompt, temperature, max_tokens, _retry + 1)
+
+        # Daily token quota exhausted (or retries failed) → try Anthropic
+        if "rate_limit" in err or "429" in err or "quota" in err or "tokens per day" in err:
+            st.warning("⚠️ Groq daily limit reached — switching to Anthropic Claude fallback…")
+            result = _call_anthropic_fallback(system_prompt, user_prompt, max_tokens)
+            if result is not None:
+                st.info("✅ Anthropic fallback succeeded.")
+                return result
+            st.error("Anthropic fallback also failed. Add ANTHROPIC_API_KEY to Streamlit secrets.")
+            return None
 
         st.error(f"LLM Error: {str(e)}")
         return None
@@ -543,13 +591,13 @@ Remove false positives. Add: "X/Y verified (Z removed)".""",
 
 def run_ablation(client, code, sample_name="sample", progress_cb=None):
     results = {}
-    DELAY = 2   # slightly longer to stay within Groq free-tier limits
+    DELAY = 8   # slightly longer to stay within Groq free-tier limits
 
     if progress_cb: progress_cb("Tool Agent...")
     tf = tool_agent(code)
 
     if progress_cb: progress_cb("Single Agent...")
-    single = "Tool baseline only"
+    single = single_agent_review(client, code)
     time.sleep(DELAY)
     if single is None:
         st.error(f"LLM call failed for Single Agent on '{sample_name}'. Check your API key / quota.")
@@ -577,7 +625,7 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
         return {}
 
     if progress_cb: progress_cb("Debate Agent...")
-    # debate = debate_agent(client, sec, corr, code)
+    debate = debate_agent(client, sec, corr, code)
     time.sleep(DELAY)
 
     if progress_cb: progress_cb("Synthesizer (with debate)...")
@@ -600,11 +648,8 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
     }
 
     for name, output in configs.items():
-        if name not in ["Single Agent", "Full (no Debate)"]:
-            continue
         if progress_cb: progress_cb(f"Judging: {name}...")
-        # raw = llm_as_judge(client, code, output)
-        scores = None
+        raw = llm_as_judge(client, code, output)
         time.sleep(DELAY)
         scores = parse_judge_score(raw)
         results[name] = {"avg_score": scores["total"] if scores else None,
@@ -1000,6 +1045,23 @@ with st.sidebar:
                 st.success("Key set")
             else:
                 st.warning("Enter key")
+
+    # ── Anthropic fallback key ──────────────────────────────
+    st.divider()
+    st.markdown("### 🔁 Fallback (Anthropic)")
+    st.caption("Used when Groq daily limit is hit")
+    if os.getenv("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", None):
+        st.success("Anthropic key loaded")
+    else:
+        if "anthropic_api_key" not in st.session_state:
+            st.session_state.anthropic_api_key = ""
+        ak = st.text_input("Anthropic API Key", type="password",
+                           value=st.session_state.anthropic_api_key, key="anthropic_key_input")
+        if ak:
+            st.session_state.anthropic_api_key = ak
+            st.success("Anthropic key set")
+        else:
+            st.caption("Optional — enables Claude fallback")
 
     st.divider()
     st.markdown("### 🏗️ Pipeline Config")
@@ -1437,8 +1499,7 @@ with tab2:
             def pcb(msg): ph.info(f"🔄 {msg}")
             with st.spinner("Running..."):
                 all_res = {}
-                for i, (name, code) in enumerate(list(samples.items())[:1]):
-                    st.write("RUNNING SAMPLE:", name)
+                for i, (name, code) in enumerate(samples.items()):
                     pcb(f"Sample {i+1}/{len(samples)}: {name}")
                     r = run_ablation(client, code, name, pcb)
                     if r:
