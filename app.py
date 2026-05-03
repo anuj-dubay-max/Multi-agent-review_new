@@ -62,6 +62,7 @@ def _call_agentrouter_fallback(system_prompt, user_prompt, max_tokens=200):
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0"
             },
             json={
                 "model": "gpt-3.5-turbo",  # same model, just different provider
