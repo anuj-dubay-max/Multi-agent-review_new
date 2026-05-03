@@ -239,11 +239,10 @@ def agent_router_decision(code: str):
             timeout=10
         )
         st.write("Router raw response:", response.text)
-        response.raise_for_status()
-        try:
-            data = response.json()
-        except:
-            st.warning("Router returned invalid JSON")
+
+        # 1. Check HTTP status first
+        if response.status_code != 200:
+            st.warning(f"Router HTTP error: {response.status_code}")
             return {
                 "use_security": True,
                 "use_correctness": True,
@@ -251,13 +250,56 @@ def agent_router_decision(code: str):
                 "use_single": True
             }
 
-        decision = data.get("decision", {})
+        # 2. Check empty response
+        if not response.text or not response.text.strip():
+            st.warning("Router returned empty response")
+            return {
+                "use_security": True,
+                "use_correctness": True,
+                "use_synth": True,
+                "use_single": True
+            }
 
+        # 3. Safe JSON parse
+        try:
+            data = response.json()
+        except Exception as e:
+            st.warning(f"Router JSON error: {e}")
+            st.write("Raw:", response.text[:300])
+            return {
+                "use_security": True,
+                "use_correctness": True,
+                "use_synth": True,
+                "use_single": True
+            }
+
+        # 4. Validate structure
+        if not isinstance(data, dict):
+            st.warning("Router returned non-dict JSON")
+            return {
+                "use_security": True,
+                "use_correctness": True,
+                "use_synth": True,
+                "use_single": True
+            }
+
+        decision = data.get("decision")
+
+        if not isinstance(decision, dict):
+            st.warning("Router missing 'decision' field")
+            return {
+                "use_security": True,
+                "use_correctness": True,
+                "use_synth": True,
+                "use_single": True
+            }
+
+        # 5. Final safe mapping
         result = {
-            "use_security": decision.get("security", True),
-            "use_correctness": decision.get("correctness", True),
-            "use_synth": decision.get("synth", True),
-            "use_single": False   # default OFF to save tokens
+            "use_security": bool(decision.get("security", True)),
+            "use_correctness": bool(decision.get("correctness", True)),
+            "use_synth": bool(decision.get("synth", True)),
+            "use_single": False
         }
 
         return result
@@ -1414,6 +1456,7 @@ with tab1:
                     text=[f"{sa_metrics['f1']}", f"{ma_metrics['f1']}"],
                     textposition='outside'
                 ))
+                ct = chart_theme()
                 gt_fig.update_layout(
                     barmode='group',
                     title=f"Precision / Recall / F1 vs Ground Truth ({sample_name})",
