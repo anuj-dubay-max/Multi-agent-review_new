@@ -37,7 +37,7 @@ def get_client():
     except Exception:
         return None
     
-def call_llm(system_prompt, user_prompt, temperature=0.3, max_tokens=200):
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200):
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
