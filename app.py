@@ -97,26 +97,7 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500
         st.error(f"LLM Error: {str(e)}")
         return None
 
-        if "rate_limit" in str(e).lower():
-            st.warning("Rate limit hit. Retrying in 10s...")
-            time.sleep(10)
-
-            try:
-                resp = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                return resp.choices[0].message.content
-            except:
-                pass
-
-        st.error(f"LLM Error: {str(e)}")
-        return None    
+        
 
 MEMORY_FILE = "review_memory.json"
 ABLATION_CACHE = "ablation_cache.json"
@@ -257,8 +238,18 @@ def agent_router_decision(code: str):
             },
             timeout=10
         )
+        st.write("Router raw response:", response.text)
         response.raise_for_status()
-        data = response.json()
+        try:
+            data = response.json()
+        except:
+            st.warning("Router returned invalid JSON")
+            return {
+                "use_security": True,
+                "use_correctness": True,
+                "use_synth": True,
+                "use_single": True
+            }
 
         decision = data.get("decision", {})
 
@@ -538,7 +529,18 @@ def extract_keywords(text):
     ]
 
     for label, patterns in mapping:
-        if any(re.search(p, text) for p in patterns):
+        matched = False
+
+        for p in patterns:
+            try:
+                if re.search(p, text):
+                    matched = True
+                    break
+            except re.error:
+                # skip bad regex instead of crashing entire app
+                continue
+
+        if matched:
             keywords.append(label)
 
     return set(keywords)
@@ -1215,6 +1217,11 @@ with tab1:
                 if route["use_correctness"]:
                     status.info("🐛 Step 3/5: Correctness Reviewer...")
                     corr_review = correctness_reviewer(client, code_input, tool_findings)
+
+                    if corr_review is None:
+                        st.error("Correctness reviewer failed")
+                        st.stop()
+
                     time.sleep(API_DELAY)
                 else:
                     st.info("⏭️ Correctness Reviewer skipped by router")
@@ -1223,18 +1230,22 @@ with tab1:
 
                 status.info("📝 Step 4/5: Synthesizing...")
                 final_review = ""
-                if sec_review or corr_review:
-                    final_review = synthesizer(client, sec_review, corr_review, tool_findings) 
-                if not final_review:
+                if route["use_synth"] and (sec_review or corr_review):
+                    final_review = synthesizer(client, sec_review, corr_review, tool_findings)
+                else:
                     parts = []
-                    if sec_review: parts.append(f"## Security\n{sec_review}")
-                    if corr_review: parts.append(f"## Correctness\n{corr_review}")
-                    final_review = "\n\n---\n\n".join(parts) if parts else "All agents failed. Wait 60s and retry."
-                progress.progress(80)
-                time.sleep(API_DELAY)
+                    if sec_review and sec_review != "Skipped by router":
+                        parts.append(f"## Security\n{sec_review}")
+                    if corr_review and corr_review != "Skipped by router":
+                        parts.append(f"## Correctness\n{corr_review}")
+
+                    final_review = "\n\n---\n\n".join(parts) if parts else "No issues."
 
                 status.info("👤 Step 5/5: Single agent baseline...")
-                single_out = single_agent_review(client, code_input) 
+                if route["use_single"]:
+                    single_out = single_agent_review(client, code_input)
+                else:
+                    single_out = ""
                 progress.progress(100)
                 elapsed = round(time.time() - start_time, 1)
                 status.success(f"Done! ({elapsed}s)")
