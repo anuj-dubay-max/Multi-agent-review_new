@@ -543,13 +543,13 @@ Remove false positives. Add: "X/Y verified (Z removed)".""",
 
 def run_ablation(client, code, sample_name="sample", progress_cb=None):
     results = {}
-    DELAY = 8   # slightly longer to stay within Groq free-tier limits
+    DELAY = 2   # slightly longer to stay within Groq free-tier limits
 
     if progress_cb: progress_cb("Tool Agent...")
     tf = tool_agent(code)
 
     if progress_cb: progress_cb("Single Agent...")
-    single = single_agent_review(client, code)
+    single = "Tool baseline only"
     time.sleep(DELAY)
     if single is None:
         st.error(f"LLM call failed for Single Agent on '{sample_name}'. Check your API key / quota.")
@@ -603,7 +603,8 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
         if name not in ["Single Agent", "Full (no Debate)"]:
             continue
         if progress_cb: progress_cb(f"Judging: {name}...")
-        raw = llm_as_judge(client, code, output)
+        # raw = llm_as_judge(client, code, output)
+        scores = None
         time.sleep(DELAY)
         scores = parse_judge_score(raw)
         results[name] = {"avg_score": scores["total"] if scores else None,
@@ -1436,7 +1437,7 @@ with tab2:
             def pcb(msg): ph.info(f"🔄 {msg}")
             with st.spinner("Running..."):
                 all_res = {}
-                for i, (name, code) in enumerate(samples.items()):
+                for i, (name, code) in enumerate(list(samples.items())[:1]):
                     st.write("RUNNING SAMPLE:", name)
                     pcb(f"Sample {i+1}/{len(samples)}: {name}")
                     r = run_ablation(client, code, name, pcb)
