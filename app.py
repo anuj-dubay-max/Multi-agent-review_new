@@ -50,22 +50,18 @@ def _call_agentrouter_fallback(system_prompt, user_prompt, max_tokens=200):
         or st.secrets.get("AGENT_ROUTER_API_KEY", None)
         or st.session_state.get("agent_router_api_key", None)
     )
-    
-    st.write("AgentRouter key (first 5 chars):", api_key[:5] if api_key else "NONE")
     if not api_key:
         return None
 
     try:
         resp = requests.post(
-            
             "https://agentrouter.org/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0"
             },
             json={
-                "model": "gpt-3.5-turbo",  # same model, just different provider
+                "model": "llama-3.3-70b-versatile",  # same model, just different provider
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_prompt},
@@ -75,21 +71,12 @@ def _call_agentrouter_fallback(system_prompt, user_prompt, max_tokens=200):
             },
             timeout=60,
         )
-        st.write("AgentRouter RAW:", resp.text[:300])
 
         if resp.status_code != 200:
             st.error(f"AgentRouter error {resp.status_code}: {resp.text[:200]}")
             return None
 
-        if not resp.text.strip():
-            st.error("AgentRouter returned EMPTY response")
-            return None
-
-        try:
-            data = resp.json()
-        except:
-            st.error(f"Invalid JSON from AgentRouter:\n{resp.text[:300]}")
-            return None
+        data = resp.json()
         return data["choices"][0]["message"]["content"]
 
     except Exception as e:
