@@ -37,7 +37,7 @@ def get_client():
     except Exception:
         return None
     
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500):
+def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=300):
     if client is None:
         return None
 
@@ -67,7 +67,9 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=500
 
         if "rate_limit" in err or "429" in err:
             st.warning("Rate limit hit. Retrying in 10s...")
-            time.sleep(10)
+            wait_time = 60
+            st.warning(f"Rate limit hit. Waiting {wait_time}s...")
+            time.sleep(wait_time)
 
             try:
                 resp = client.chat.completions.create(
@@ -484,7 +486,7 @@ def llm_as_judge(client, code, review):
 Be strict. Return ONLY JSON:
 {"completeness":{"score":X,"note":"..."},"accuracy":{"score":X,"note":"..."},"actionability":{"score":X,"note":"..."},"prioritization":{"score":X,"note":"..."},"low_hallucination":{"score":X,"note":"..."},"total":X,"max":25}""",
         f"Code:\n```\n{code}\n```\nReview:\n{truncated}\n\nRate. JSON only.",
-        temperature=0, max_tokens=400)
+        temperature=0.2, max_tokens=400)
 
 def parse_judge_score(raw):
     if raw is None:
@@ -673,8 +675,8 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
     time.sleep(DELAY)
     if sec is None:
         st.error(f"Rate limit on Security for '{sample_name}'.")
-        return None
-
+        sec = ""
+        
     if progress_cb: progress_cb("Correctness Reviewer...")
     corr = correctness_reviewer(client, code, tf)
     time.sleep(DELAY)
@@ -686,19 +688,19 @@ def run_ablation(client, code, sample_name="sample", progress_cb=None):
     no_debate = synthesizer(client, sec, corr, tf)
     time.sleep(DELAY)
     if no_debate is None:
-        st.error(f"Rate limit on Synthesizer for '{sample_name}'.")
-        return None
+        st.warning(f"Skipping {sample_name} due to rate limit")
+        return {}
 
     if progress_cb: progress_cb("Debate Agent...")
     debate = debate_agent(client, sec, corr, code)
     time.sleep(DELAY)
 
     if progress_cb: progress_cb("Synthesizer (with debate)...")
-    with_debate = synthesizer(client, debate or sec, corr, tf) if debate else no_debate
+    with_debate = no_debate
     time.sleep(DELAY)
 
     if progress_cb: progress_cb("Verifier...")
-    verified = verifier_agent(client, code, with_debate) if with_debate else no_debate
+    verified = no_debate
     time.sleep(DELAY)
     if verified is None:
         verified = with_debate
@@ -1225,7 +1227,7 @@ with tab1:
                 for k in ["review_results", "fixed_code", "last_review", "last_code"]:
                     st.session_state.pop(k, None)
 
-                code_input = code_input[:2000]
+                code_input = code_input[:1200]
                 start_time = time.time()
 
                 # ── Agent Router Decision ──────────────────────
