@@ -1158,16 +1158,15 @@ with st.sidebar:
 # CHART THEME HELPER  ← NEW
 # ══════════════════════════════════════════════════════════════
 
-def chart_theme(_=None):
-    return dict(
-        template="plotly_white",
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#f8f9fa",
-        font=dict(color="#111111"),
-        xaxis=dict(gridcolor="#e0e0e0", tickfont=dict(color="#444")),
-        yaxis=dict(gridcolor="#e0e0e0", tickfont=dict(color="#444")),
-        legend=dict(bgcolor="#ffffff", font=dict(color="#111111")),
-    )
+def chart_theme():
+    return {
+        "template": "plotly_white",
+        "paper_bgcolor": "#ffffff",
+        "plot_bgcolor": "#f8f9fa",
+        "font": dict(color="#111111"),
+        "xaxis": dict(gridcolor="#e0e0e0"),
+        "yaxis": dict(gridcolor="#e0e0e0"),
+    }
 
 # ══════════════════════════════════════════════════════════════
 # MAIN TABS
@@ -1457,14 +1456,20 @@ with tab1:
                     textposition='outside'
                 ))
                 ct = chart_theme()
-                gt_fig.update_layout(
+
+                layout_args = dict(
                     barmode='group',
                     title=f"Precision / Recall / F1 vs Ground Truth ({sample_name})",
                     yaxis_title="Score",
                     yaxis=dict(range=[0, 1.1]),
                     height=350,
-                    **ct
                 )
+
+                # merge safely
+                if isinstance(ct, dict):
+                    layout_args.update(ct)
+
+                gt_fig.update_layout(**layout_args)
                 st.plotly_chart(gt_fig, use_container_width=True)
 
                 # Show which issues were found/missed
@@ -1492,12 +1497,16 @@ with tab1:
                     text=[f"{sa_metrics['fp']}", f"{ma_metrics['fp']}"],
                     textposition='outside'
                 ))
-                fp_chart.update_layout(
+                layout_args = dict(
                     title=f"False Positives on Clean Code ({sample_name})",
                     yaxis_title="Count",
                     height=300,
-                    **ct
                 )
+
+                if isinstance(ct, dict):
+                    layout_args.update(ct)
+
+                fp_chart.update_layout(**layout_args)
                 st.plotly_chart(fp_chart, use_container_width=True)
                 if sa_metrics['fp'] == 0 and ma_metrics['fp'] == 0:
                     st.success("Neither agent hallucinated issues on clean code!")
