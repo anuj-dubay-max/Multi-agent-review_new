@@ -37,10 +37,7 @@ def get_client():
     except Exception:
         return None
     
-def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=300):
-    if client is None:
-        return None
-
+def call_llm(system_prompt, user_prompt, temperature=0.3, max_tokens=200):
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -51,55 +48,52 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=300
             temperature=temperature,
             max_tokens=max_tokens
         )
-
-        st.session_state["token_count"]["calls"] += 1
-
-        try:
-            used = resp.usage.total_tokens
-            st.session_state["token_count"]["total"] += used
-        except:
-            pass
-
         return resp.choices[0].message.content
 
     except Exception as e:
         err = str(e).lower()
 
+        # 🔥 IF RATE LIMIT → SWITCH PROVIDER
         if "rate_limit" in err or "429" in err:
-            st.warning("Rate limit hit. Retrying in 10s...")
-            wait_time = 60
-            st.warning(f"Rate limit hit. Waiting {wait_time}s...")
-            time.sleep(wait_time)
+            st.warning("Groq limit hit → switching to Agent Router")
 
-            try:
-                resp = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
+            return call_agent_router(system_prompt, user_prompt)
 
-                st.session_state["token_count"]["calls"] += 1
-
-                try:
-                    used = resp.usage.total_tokens
-                    st.session_state["token_count"]["total"] += used
-                except:
-                    pass
-
-                return resp.choices[0].message.content
-
-            except:
-                pass
-
-        st.session_state["token_count"]["errors"] += 1
         st.error(f"LLM Error: {str(e)}")
         return None
-
         
+def call_agent_router(system_prompt, user_prompt):
+    api_key = os.getenv("AGENT_ROUTER_API_KEY")
+
+    try:
+        response = requests.post(
+            "https://agentrouter.org/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 200
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            st.warning("Agent Router failed")
+            return None
+
+        data = response.json()
+
+        return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        st.error(f"Router fallback failed: {e}")
+        return None
 
 MEMORY_FILE = "review_memory.json"
 ABLATION_CACHE = "ablation_cache.json"
@@ -298,9 +292,9 @@ def agent_router_decision(code: str):
 
         # 5. Final safe mapping
         result = {
-            "use_security": bool(decision.get("security", True)),
-            "use_correctness": bool(decision.get("correctness", True)),
-            "use_synth": bool(decision.get("synth", True)),
+            "use_security": bool(decision.get("security", False)),
+            "use_correctness": bool(decision.get("correctness", False)),
+            "use_synth": bool(decision.get("synth", False)),
             "use_single": False
         }
 
