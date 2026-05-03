@@ -37,51 +37,61 @@ def get_client():
     except Exception:
         return None
 
-def _call_anthropic_fallback(system_prompt, user_prompt, max_tokens=200):
-    """Fallback to Anthropic Claude (claude-haiku-4-5-20251001) when Groq quota is exhausted."""
+def _call_agentrouter_fallback(system_prompt, user_prompt, max_tokens=200):
+    """Fallback to AgentRouter (agentrouter.org/v1 — OpenAI-compatible gateway)
+    when Groq daily token quota is exhausted.
+
+    AgentRouter is a non-profit OpenAI-compatible API that proxies Claude, GPT,
+    Gemini and 30+ models behind a single endpoint. The correct base URL is
+    https://agentrouter.org/v1  (NOT /api/v1 — that path returns an HTML WAF page).
+    """
     api_key = (
-        os.getenv("ANTHROPIC_API_KEY")
-        or st.secrets.get("ANTHROPIC_API_KEY", None)
-        or st.session_state.get("anthropic_api_key", None)
+        os.getenv("AGENT_ROUTER_API_KEY")
+        or st.secrets.get("AGENT_ROUTER_API_KEY", None)
+        or st.session_state.get("agent_router_api_key", None)
     )
     if not api_key:
         return None
 
     try:
         resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://agentrouter.org/v1/chat/completions",
             headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": "llama-3.3-70b-versatile",  # same model, just different provider
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "temperature": 0.3,
                 "max_tokens": max_tokens,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_prompt}],
             },
             timeout=60,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data["content"][0]["text"]
-        else:
-            st.error(f"Anthropic fallback error {resp.status_code}: {resp.text[:200]}")
+
+        if resp.status_code != 200:
+            st.error(f"AgentRouter error {resp.status_code}: {resp.text[:200]}")
             return None
+
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
     except Exception as e:
-        st.error(f"Anthropic fallback exception: {e}")
+        st.error(f"AgentRouter fallback exception: {e}")
         return None
 
 
 def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200, _retry=0):
-    """Call Groq LLM with exponential backoff, then fall back to Anthropic Claude."""
+    """Call Groq LLM with exponential backoff, then fall back to AgentRouter."""
     try:
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user",   "content": user_prompt},
             ],
             temperature=temperature,
             max_tokens=max_tokens,
@@ -91,21 +101,21 @@ def call_llm(client, system_prompt, user_prompt, temperature=0.3, max_tokens=200
     except Exception as e:
         err = str(e).lower()
 
-        # Retry up to 3× with exponential backoff for transient rate limits
+        # Transient rate limit — retry with exponential backoff (10s → 20s → 40s)
         if ("rate_limit" in err or "429" in err) and _retry < 3:
-            wait = 10 * (2 ** _retry)  # 10s → 20s → 40s
+            wait = 10 * (2 ** _retry)
             st.warning(f"Groq rate limit — retrying in {wait}s (attempt {_retry + 1}/3)…")
             time.sleep(wait)
             return call_llm(client, system_prompt, user_prompt, temperature, max_tokens, _retry + 1)
 
-        # Daily token quota exhausted (or retries failed) → try Anthropic
+        # Daily token quota exhausted → fall back to AgentRouter
         if "rate_limit" in err or "429" in err or "quota" in err or "tokens per day" in err:
-            st.warning("⚠️ Groq daily limit reached — switching to Anthropic Claude fallback…")
-            result = _call_anthropic_fallback(system_prompt, user_prompt, max_tokens)
+            st.warning("⚠️ Groq daily limit reached — switching to AgentRouter fallback…")
+            result = _call_agentrouter_fallback(system_prompt, user_prompt, max_tokens)
             if result is not None:
-                st.info("✅ Anthropic fallback succeeded.")
+                st.info("✅ AgentRouter fallback succeeded.")
                 return result
-            st.error("Anthropic fallback also failed. Add ANTHROPIC_API_KEY to Streamlit secrets.")
+            st.error("AgentRouter fallback also failed. Check AGENT_ROUTER_API_KEY in Streamlit secrets.")
             return None
 
         st.error(f"LLM Error: {str(e)}")
@@ -1046,22 +1056,22 @@ with st.sidebar:
             else:
                 st.warning("Enter key")
 
-    # ── Anthropic fallback key ──────────────────────────────
+    # ── AgentRouter fallback key ────────────────────────────
     st.divider()
-    st.markdown("### 🔁 Fallback (Anthropic)")
-    st.caption("Used when Groq daily limit is hit")
-    if os.getenv("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", None):
-        st.success("Anthropic key loaded")
+    st.markdown("### 🔁 Fallback (AgentRouter)")
+    st.caption("Used automatically when Groq daily limit is hit")
+    if os.getenv("AGENT_ROUTER_API_KEY") or st.secrets.get("AGENT_ROUTER_API_KEY", None):
+        st.success("AgentRouter key loaded")
     else:
-        if "anthropic_api_key" not in st.session_state:
-            st.session_state.anthropic_api_key = ""
-        ak = st.text_input("Anthropic API Key", type="password",
-                           value=st.session_state.anthropic_api_key, key="anthropic_key_input")
-        if ak:
-            st.session_state.anthropic_api_key = ak
-            st.success("Anthropic key set")
+        if "agent_router_api_key" not in st.session_state:
+            st.session_state.agent_router_api_key = ""
+        ark = st.text_input("AgentRouter API Key", type="password",
+                            value=st.session_state.agent_router_api_key, key="ar_key_input")
+        if ark:
+            st.session_state.agent_router_api_key = ark
+            st.success("AgentRouter key set")
         else:
-            st.caption("Optional — enables Claude fallback")
+            st.caption("Optional — enables fallback when Groq quota is hit")
 
     st.divider()
     st.markdown("### 🏗️ Pipeline Config")
