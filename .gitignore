@@ -1,4 +1,8 @@
 .env
 memory.json
+review_memory.json
+ablation_cache.json
 __pycache__/
 *.pyc
+.streamlit/
+.venv/
